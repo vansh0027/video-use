@@ -48,6 +48,10 @@ try:
     import image_gen as _image_gen
 except Exception:  # pragma: no cover
     _image_gen = None
+try:
+    import video_gen as _video_gen
+except Exception:  # pragma: no cover
+    _video_gen = None
 
 __all__ = ["auto_broll_specs"]
 
@@ -126,8 +130,9 @@ def auto_broll_specs(
     insert_dur: float = 2.2,
     out_dir: str = ".",
     placement: str = "full",
+    motion: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Return ``images`` overlay specs (``source:"file"``) for concept moments.
+    """Return overlay specs (``source:"file"``) for concept moments.
 
     Args:
         words:       reel words on the OUTPUT timeline ({text,start,end}).
@@ -137,6 +142,11 @@ def auto_broll_specs(
         insert_dur:  how long each cutaway sits on screen (clamped to its beat).
         out_dir:     where resolved assets are written.
         placement:   overlay placement for the inserts ("full" by default).
+        motion:      when True, ABSTRACT concept beats (storyboard ``scene``)
+                     become a free MOVING clip via ``video_gen`` ``flux_morph``
+                     (evolving generated B-roll, no paid key); the spec is then
+                     marked ``"video": True``. Concrete concepts (real campuses /
+                     crests / stock) stay as stills — morphing those looks wrong.
 
     Never raises. Returns ``[]`` when storyboard is unavailable, nothing is
     visual-worthy, or no asset resolves.
@@ -159,19 +169,38 @@ def auto_broll_specs(
     specs: List[Dict[str, Any]] = []
     os.makedirs(out_dir, exist_ok=True)
     for beat in _select_beats(beats, max_inserts):
-        path = _resolve_asset(beat, out_dir)
-        if not path:
-            continue
         b_start = float(beat["start"])
         b_len = max(0.0, float(beat["end"]) - b_start)
         # Sit the cutaway near the start of its beat, never longer than the beat.
         dur = max(0.8, min(float(insert_dur), b_len if b_len > 0 else float(insert_dur)))
+
+        is_video = False
+        path = None
+        # Abstract concept + motion -> a free moving generated clip.
+        if motion and beat.get("kind") == "scene" and _video_gen is not None:
+            try:
+                clip = _video_gen.gen_video(
+                    prompt=str(beat.get("query") or ""), out_dir=out_dir,
+                    duration=round(dur, 3), width=_W, height=_H,
+                    seed=int(round(b_start * 10)) % 100000, backend="flux_morph",
+                )
+                if clip and os.path.isfile(clip):
+                    path, is_video = clip, True
+            except Exception:
+                path = None
+        if not path:
+            path = _resolve_asset(beat, out_dir)   # still fallback
+        if not path:
+            continue
+
         specs.append({
             "source": "file",
             "file": path,
+            "video": is_video,
             "at": round(b_start, 3),
             "duration": round(dur, 3),
-            "placement": ("under_caption" if beat.get("kind") == "logos" else placement),
+            "placement": ("full" if is_video else
+                          ("under_caption" if beat.get("kind") == "logos" else placement)),
             "label": beat.get("label") or beat.get("query"),
             "_auto_broll": True,
         })

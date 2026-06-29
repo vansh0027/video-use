@@ -983,6 +983,19 @@ def final_pass(
                 f"[{prev}][{src}]overlay=x='{xexpr}':y=1450:"
                 f"enable='between(t,{at:.3f},{end:.3f})'[{lbl}]"
             )
+        elif kind == "video":
+            # A moving B-roll clip (e.g. flux_morph). Reset its PTS and offset to
+            # the overlay window so it plays from its OWN frame 0 at `at` (without
+            # this it would show the middle of the clip / EOF). Full-frame cutaway,
+            # gated to its window; its audio is ignored (base audio stays master).
+            pre = f"vid{idx}"
+            fc_parts.append(
+                f"[{src}]setpts=PTS-STARTPTS+{at:.3f}/TB,setsar=1[{pre}]"
+            )
+            fc_parts.append(
+                f"[{prev}][{pre}]overlay=0:0:"
+                f"enable='between(t,{at:.3f},{end:.3f})'[{lbl}]"
+            )
         else:
             # hook_card / logo_row / single image: pre-positioned full-frame, so
             # it sits at 0:0 and is gated to its output-timeline window. The
@@ -1902,27 +1915,36 @@ def build(args: argparse.Namespace) -> int:
     # inserts to the image spec (resolved through the same file-overlay path).
     # Visual only (no on-screen text) -> safe on spoken_only face reels.
     n_broll = int(getattr(args, "auto_broll", 0) or 0)
+    auto_video_overlays: List[Dict[str, Any]] = []
     if n_broll > 0:
         if _auto_broll is None:
             print("[build_short] --auto-broll requested but engine/auto_broll is "
                   "unavailable; skipping.", file=sys.stderr)
         else:
+            # motion=True -> abstract concepts become free moving flux_morph clips.
             broll = _auto_broll.auto_broll_specs(
                 out_words, duration, kit, max_inserts=n_broll,
-                out_dir=os.path.join(tmpdir, "assets"),
+                out_dir=os.path.join(tmpdir, "assets"), motion=True,
             )
             if broll and spoken_only:
                 # Face reel: B-roll is allowed (it's visual) but its LABEL is
-                # unspoken text — strip it and show the footage full-frame with
-                # no chip/caption, per the spoken_only policy (SURFACES.md).
+                # unspoken text — strip it and show full-frame with no chip/caption.
                 for b in broll:
                     b.pop("label", None)
                     b["placement"] = "full"
             if broll:
-                labels = ", ".join(str(b.get("label") or "image")[:24] for b in broll)
-                print(f"[build_short] auto-broll: {len(broll)} real-footage "
-                      f"insert(s) at concept moments ({labels})", file=sys.stderr)
-                images_spec = list(images_spec) + broll
+                # Moving clips -> video overlays (setpts-timed); stills -> image path.
+                broll_videos = [b for b in broll if b.get("video")]
+                broll_images = [b for b in broll if not b.get("video")]
+                for b in broll_videos:
+                    auto_video_overlays.append({
+                        "kind": "video", "asset": b["file"],
+                        "at": float(b["at"]), "duration": float(b["duration"]),
+                    })
+                images_spec = list(images_spec) + broll_images
+                print(f"[build_short] auto-broll: {len(broll)} insert(s) at concept "
+                      f"moments ({len(broll_videos)} moving, {len(broll_images)} "
+                      f"still)", file=sys.stderr)
             else:
                 print("[build_short] auto-broll: no concept moments resolved "
                       "(no keys/assets?); continuing without.", file=sys.stderr)
@@ -1932,7 +1954,8 @@ def build(args: argparse.Namespace) -> int:
     logo_row_overlays = [o for o in img_overlays if o.get("kind") == "logo_row"]
     single_overlays = [o for o in img_overlays if o.get("kind") != "logo_row"]
 
-    overlays = hook_overlays + logo_row_overlays + lt_overlays + single_overlays
+    overlays = (hook_overlays + logo_row_overlays + lt_overlays
+                + single_overlays + auto_video_overlays)
     if overlays:
         print(f"[build_short] overlays: {len(hook_overlays)} hook card, "
               f"{len(logo_row_overlays)} logo row(s), {len(lt_overlays)} "
