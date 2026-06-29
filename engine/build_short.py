@@ -95,7 +95,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # --------------------------------------------------------------------------- #
 _ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROFILES_DIR = os.path.join(_ENGINE_DIR, "profiles")
-for _p in (_ENGINE_DIR, _PROFILES_DIR):
+_HELPERS_DIR = os.path.join(os.path.dirname(_ENGINE_DIR), "helpers")
+for _p in (_ENGINE_DIR, _PROFILES_DIR, _HELPERS_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -109,6 +110,20 @@ import image_overlay  # noqa: E402 (positioned 1080x1920 overlay PNG builder)
 import motiongfx  # noqa: E402    (animated hook card + lower-third graphics)
 import loop  # noqa: E402         (seamless end->start loop post-process)
 from loader import load_profile  # noqa: E402  (engine/profiles/loader.py)
+
+# Style presets (engine/styles/) and the grade-preset filter strings
+# (helpers/grade.py) are optional: --style is the only thing that needs them, so
+# a missing module degrades to "no style" rather than breaking a plain render.
+try:
+    from styles.registry import load_style, available_styles  # noqa: E402
+except Exception:  # pragma: no cover
+    load_style = None
+    def available_styles():  # type: ignore
+        return []
+try:
+    import grade as _grade  # noqa: E402  (helpers/grade.py: PRESETS + get_preset)
+except Exception:  # pragma: no cover
+    _grade = None
 
 
 # --------------------------------------------------------------------------- #
@@ -490,17 +505,22 @@ def encode_segment(
     out_path: str,
     *,
     punch: Optional[float],
+    grade: Optional[str] = None,
 ) -> None:
     """Extract one range, normalize to vertical (+ optional punch-in), polish audio.
 
     loudnorm is intentionally NOT applied here — it runs once in the final pass.
     Boundary 30 ms fades ARE applied per segment so concatenated seams never pop.
+    ``grade`` is an optional ffmpeg colour-filter string (from a style preset /
+    helpers.grade); applied to the normalized frame, before the punch crop, so
+    every segment carries the look and the concat stays consistent.
     """
     start, end = rng["start"], rng["end"]
     dur = end - start
 
     vf = transforms.compose([
         transforms.normalize_vertical(src_w, src_h),
+        grade or "",
         transforms.punch_in(punch) if punch and punch > 1.0 else "",
     ])
 
@@ -1452,6 +1472,58 @@ def build(args: argparse.Namespace) -> int:
         else:
             punch_default = 1.12
 
+    # --style: a reel "look" (engine/styles/<name>.json) layered over the brand
+    # kit + profile. A style sets grade + punch + caption preset + (later) sfx,
+    # but NEVER colours (identity stays in the brand kit) and NEVER on-screen
+    # text — so it is fully compatible with the spoken_only face-reel policy.
+    style_grade: Optional[str] = None
+    style_name = getattr(args, "style", None)
+    if style_name:
+        if load_style is None:
+            print("[build_short] --style requested but engine/styles is "
+                  "unavailable; ignoring.", file=sys.stderr)
+        else:
+            try:
+                style = load_style(style_name)
+            except Exception as exc:
+                raise BuildError(
+                    f"--style {style_name!r}: {exc} "
+                    f"(available: {', '.join(available_styles()) or 'none'})"
+                ) from exc
+            # grade -> resolve the preset name to an ffmpeg filter string.
+            g = (style.get("grade") or {})
+            gp = g.get("preset") if isinstance(g, dict) else g
+            if gp and gp != "none":
+                if _grade is None:
+                    print("[build_short] style grade requested but helpers/grade "
+                          "is unavailable; skipping grade.", file=sys.stderr)
+                else:
+                    try:
+                        style_grade = _grade.get_preset(str(gp))
+                    except Exception as exc:
+                        print(f"[build_short] style grade {gp!r} skipped: {exc}",
+                              file=sys.stderr)
+            # punch -> override the profile default.
+            spin = style.get("punch_in")
+            if isinstance(spin, dict) and "pct" in spin:
+                try:
+                    punch_default = float(spin["pct"]) / 100.0
+                except (TypeError, ValueError):
+                    pass
+            # captions -> merge preset + NON-COLOUR overrides onto the brand kit's
+            # caption_style. Colours (fill/highlight/outline) stay from the kit.
+            scap = style.get("captions") or {}
+            cap_style = dict(kit.get("caption_style") or {})
+            if scap.get("preset"):
+                cap_style["preset"] = scap["preset"]
+            for k, v in (scap.get("overrides") or {}).items():
+                if k not in ("fill", "highlight", "outline"):
+                    cap_style[k] = v
+            kit["caption_style"] = cap_style
+            print(f"[build_short] style '{style_name}': grade="
+                  f"{(gp if style_grade else 'none')}, punch={punch_default}, "
+                  f"caption={cap_style.get('preset')}", file=sys.stderr)
+
     captions_cfg = profile.get("captions") or {}
     captions_on = bool(captions_cfg.get("on", True)) and bool(captions_cfg.get("animated", True))
 
@@ -1517,7 +1589,7 @@ def build(args: argparse.Namespace) -> int:
     for i, rng in enumerate(ranges):
         seg = os.path.join(tmpdir, f"seg_{i:03d}.mp4")
         punch = rng.get("zoom", punch_default)
-        encode_segment(source, rng, src_w, src_h, seg, punch=punch)
+        encode_segment(source, rng, src_w, src_h, seg, punch=punch, grade=style_grade)
         seg_paths.append(seg)
 
     # 4) concat -> base.mp4
@@ -1634,6 +1706,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="brand kit name (engine/brandkits/<name>.json)")
     p.add_argument("--profile", default="founder_edtech",
                    help="edit profile name (engine/profiles/<name>.json)")
+    p.add_argument("--style", default=None,
+                   help="reel style preset (engine/styles/<name>.json): "
+                        "clean_premium | dark_sizzle | founder_raw | "
+                        "hormozi_punch. Sets grade + punch + caption preset "
+                        "(never colours, never on-screen text — safe on face "
+                        "reels). Omit for the plain brand-kit look.")
     p.add_argument("--cta", default=None,
                    help="CTA line override (default: brandkit cta.text)")
     p.add_argument("--keyword", default=None,
