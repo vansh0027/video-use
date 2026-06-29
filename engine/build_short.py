@@ -124,6 +124,10 @@ try:
     import grade as _grade  # noqa: E402  (helpers/grade.py: PRESETS + get_preset)
 except Exception:  # pragma: no cover
     _grade = None
+try:
+    from effects import sfx as _sfx  # noqa: E402  (engine/effects/sfx.py)
+except Exception:  # pragma: no cover
+    _sfx = None
 
 
 # --------------------------------------------------------------------------- #
@@ -632,6 +636,63 @@ def concat_segments(seg_paths: List[str], out_path: str, tmpdir: str) -> None:
     cmd = _common_video_out(cmd)
     cmd += [out_path]
     _run(cmd, what="concat (filter re-encode)")
+
+
+def apply_style_sfx(
+    in_path: str,
+    seg_durations: List[float],
+    sfx_cfg: Optional[Dict[str, Any]],
+    tmpdir: str,
+) -> str:
+    """Mix a style's SFX cue at each internal cut seam; return a new path.
+
+    A no-op (returns ``in_path`` unchanged) when SFX is off, the effects.sfx
+    module is unavailable, or there are fewer than two segments (a single
+    continuous take has no cut to underline). Audio-only — never adds on-screen
+    text, so it is safe on a spoken_only face reel. Failures degrade to the
+    un-sfx'd input rather than aborting the render.
+    """
+    if _sfx is None or not sfx_cfg:
+        return in_path
+    intensity = str(sfx_cfg.get("intensity") or "off").lower()
+    if intensity == "off" or len(seg_durations) < 2:
+        return in_path
+    gain = _sfx.INTENSITY_GAIN_DB.get(intensity, -12)
+    if gain is None:
+        return in_path
+
+    # Cut seams on the OUTPUT timeline = cumulative segment starts.
+    boundaries = [0.0]
+    acc = 0.0
+    for d in seg_durations[:-1]:
+        acc += float(d)
+        boundaries.append(acc)
+
+    cues = list(sfx_cfg.get("cues") or ["whoosh"])
+    cut_cue = "whoosh" if "whoosh" in cues else (cues[0] if cues else "whoosh")
+    events = _sfx.events_from_cuts(boundaries, cue=cut_cue, skip_first=True)
+    if not events:
+        return in_path
+
+    try:
+        lib = _sfx.build_cue_library(os.path.join(tmpdir, "sfx_cache"), names=[cut_cue])
+        mix = _sfx.build_sfx_mix(events, lib, gain_db=float(gain))
+        if not mix.filtergraph or mix.n_cues == 0:
+            return in_path
+        out_path = os.path.join(tmpdir, "with_sfx.mp4")
+        cmd = [
+            FFMPEG, "-y", "-i", in_path, *mix.inputs,
+            "-filter_complex", mix.filtergraph,
+            "-map", "0:v:0", "-map", mix.out_label,
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out_path,
+        ]
+        _run(cmd, what=f"style sfx ({intensity}: {len(events)} '{cut_cue}')")
+    except BuildError as exc:
+        print(f"[build_short] sfx mix skipped ({exc})", file=sys.stderr)
+        return in_path
+    print(f"[build_short] style sfx: {len(events)} '{cut_cue}' cue(s) at cuts "
+          f"(gain {gain}dB)", file=sys.stderr)
+    return out_path
 
 
 def final_pass(
@@ -1477,6 +1538,7 @@ def build(args: argparse.Namespace) -> int:
     # but NEVER colours (identity stays in the brand kit) and NEVER on-screen
     # text — so it is fully compatible with the spoken_only face-reel policy.
     style_grade: Optional[str] = None
+    style_sfx: Optional[Dict[str, Any]] = None
     style_name = getattr(args, "style", None)
     if style_name:
         if load_style is None:
@@ -1520,9 +1582,14 @@ def build(args: argparse.Namespace) -> int:
                 if k not in ("fill", "highlight", "outline"):
                     cap_style[k] = v
             kit["caption_style"] = cap_style
+            # sfx config -> applied at the cut seams after concat (audio only).
+            ssfx = style.get("sfx")
+            if isinstance(ssfx, dict):
+                style_sfx = ssfx
             print(f"[build_short] style '{style_name}': grade="
                   f"{(gp if style_grade else 'none')}, punch={punch_default}, "
-                  f"caption={cap_style.get('preset')}", file=sys.stderr)
+                  f"caption={cap_style.get('preset')}, "
+                  f"sfx={(style_sfx or {}).get('intensity', 'off')}", file=sys.stderr)
 
     captions_cfg = profile.get("captions") or {}
     captions_on = bool(captions_cfg.get("on", True)) and bool(captions_cfg.get("animated", True))
@@ -1597,12 +1664,18 @@ def build(args: argparse.Namespace) -> int:
     concat_segments(seg_paths, base, tmpdir)
     pre_caption = base
 
+    # 4b) style SFX: lay the style's cue at each internal cut seam (audio only,
+    #     no-op for a single take / sfx=off). Done on the base before any CTA so
+    #     the seam times line up with the footage segments.
+    seg_durations = [float(r["end"]) - float(r["start"]) for r in ranges]
+    pre_caption = apply_style_sfx(pre_caption, seg_durations, style_sfx, tmpdir)
+
     # 5) optional CTA card appended after the base.
     if cta_on and (keyword or cta_text):
         card = os.path.join(tmpdir, "cta.mp4")
         encode_cta_card(kit, keyword, cta_text, card)
         withcta = os.path.join(tmpdir, "withcta.mp4")
-        concat_segments([base, card], withcta, tmpdir)
+        concat_segments([pre_caption, card], withcta, tmpdir)
         pre_caption = withcta
 
     # 6) animated captions (.ass) on the speech timeline (none over CTA card).
