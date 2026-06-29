@@ -1,0 +1,54 @@
+{
+  "name": "founder_raw",
+  "description": "Authentic founder talking-head: minimal grade, karaoke-line captions, gentle punch-ins, and NO SFX. Looks like a real person talking to camera, not a produced ad. Trust over polish.",
+
+  "grade": {
+    "preset": "subtle",
+    "notes": "subtle = barely-there cleanup. Keep skin tones and the room honest — over-grading kills the 'this is real' feeling."
+  },
+
+  "captions": {
+    "preset": "karaoke_line",
+    "overrides": {
+      "uppercase": true,
+      "max_words": 4,
+      "animate": false,
+      "margin_v": 320,
+      "highlight_keywords": true,
+      "emphasize_numbers": true
+    },
+    "notes": "Whole-line captions with the active word highlighted (the familiar, readable talking-head style). Static highlight, no pop — calm and legible."
+  },
+
+  "punch_in": {
+    "pct": 108,
+    "frames": 6,
+    "notes": "Gentle 8% push on emphasis lines only. Mostly static framing — the punch is a seasoning, not the dish."
+  },
+
+  "pacing": {
+    "cut_cadence_s": 4.0,
+    "max_static_shot_s": 5.0,
+    "style": "hard",
+    "notes": "Tighten dead air and false starts, jump-cut the rambles, but keep the natural rhythm of speech. Dead-air speed-up is a good fit here over hard removal."
+  },
+
+  "transition": {
+    "default": "hard_cut",
+    "frequency": 0.0,
+    "notes": "Hard cuts only. A transition would make it feel produced, which defeats the 'raw' premise."
+  },
+
+  "sfx": {
+    "intensity": "off",
+    "cues": [],
+    "notes": "No SFX. Silence between words is part of the authenticity."
+  },
+
+  "music": {
+    "intensity": "off",
+    "duck_db": -20
+  },
+
+  "notes": "The 'just a founder talking' look — Counza's default for trust-building, build-in-public, and story content. The whole point is that it does NOT look edited. Resist adding motion, SFX, or grade."
+}

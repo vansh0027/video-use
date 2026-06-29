@@ -95,7 +95,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # --------------------------------------------------------------------------- #
 _ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROFILES_DIR = os.path.join(_ENGINE_DIR, "profiles")
-for _p in (_ENGINE_DIR, _PROFILES_DIR):
+_HELPERS_DIR = os.path.join(os.path.dirname(_ENGINE_DIR), "helpers")
+for _p in (_ENGINE_DIR, _PROFILES_DIR, _HELPERS_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -109,6 +110,31 @@ import image_overlay  # noqa: E402 (positioned 1080x1920 overlay PNG builder)
 import motiongfx  # noqa: E402    (animated hook card + lower-third graphics)
 import loop  # noqa: E402         (seamless end->start loop post-process)
 from loader import load_profile  # noqa: E402  (engine/profiles/loader.py)
+
+# Auto-B-roll (engine/auto_broll.py) is optional: --auto-broll is the only thing
+# that needs it, so a missing module degrades to "no auto b-roll".
+try:
+    import auto_broll as _auto_broll  # noqa: E402
+except Exception:  # pragma: no cover
+    _auto_broll = None
+
+# Style presets (engine/styles/) and the grade-preset filter strings
+# (helpers/grade.py) are optional: --style is the only thing that needs them, so
+# a missing module degrades to "no style" rather than breaking a plain render.
+try:
+    from styles.registry import load_style, available_styles  # noqa: E402
+except Exception:  # pragma: no cover
+    load_style = None
+    def available_styles():  # type: ignore
+        return []
+try:
+    import grade as _grade  # noqa: E402  (helpers/grade.py: PRESETS + get_preset)
+except Exception:  # pragma: no cover
+    _grade = None
+try:
+    from effects import sfx as _sfx  # noqa: E402  (engine/effects/sfx.py)
+except Exception:  # pragma: no cover
+    _sfx = None
 
 
 # --------------------------------------------------------------------------- #
@@ -378,6 +404,8 @@ def map_words_to_output(
     words: List[Dict[str, Any]],
     ranges: List[Dict[str, float]],
     duration: float,
+    seam_overlaps: Optional[List[float]] = None,
+    range_out_starts: Optional[List[float]] = None,
 ) -> List[Dict[str, Any]]:
     """Project source-time words onto the OUTPUT timeline.
 
@@ -387,6 +415,12 @@ def map_words_to_output(
       and offset each word so its time is measured from the start of the
       concatenated output:  out_t = w_t - range.start + range_offset, where
       range_offset is the cumulative length of all earlier ranges.
+
+    ``seam_overlaps`` (len ``len(ranges)-1``) makes the map transition-aware:
+    when seam i is an xfade of ``d`` seconds, range i+1 (and everything after)
+    starts ``d`` earlier on the output timeline, because the xfade overlaps the
+    outgoing tail with the incoming head. Passing it keeps captions in sync with
+    a transitioned concat. ``None`` (the default) means plain hard-cut concat.
 
     A word straddling a range boundary is clipped to that range's bounds.
     """
@@ -406,8 +440,13 @@ def map_words_to_output(
 
     mapped: List[Dict[str, Any]] = []
     offset = 0.0
-    for rng in ranges:
+    for idx, rng in enumerate(ranges):
         rs, re_ = rng["start"], rng["end"]
+        # Prefer the caller's measured output start for this range (from ACTUAL
+        # encoded segment durations) — ffmpeg frame-snaps segments a touch longer
+        # than (end-start), so nominal offsets drift over a multi-cut reel.
+        if range_out_starts is not None and idx < len(range_out_starts):
+            offset = float(range_out_starts[idx])
         for w in words:
             # overlap test against [rs, re_)
             if w["end"] <= rs or w["start"] >= re_:
@@ -421,9 +460,53 @@ def map_words_to_output(
                 "start": ws - rs + offset,
                 "end": we - rs + offset,
             })
-        offset += (re_ - rs)
+        if range_out_starts is None:
+            offset += (re_ - rs)
+            # An xfade at this seam pulls every later range earlier by its overlap.
+            if seam_overlaps and idx < len(seam_overlaps):
+                offset -= max(0.0, float(seam_overlaps[idx]))
     mapped.sort(key=lambda w: w["start"])
     return mapped
+
+
+def _apply_brand_vocab(out_words: List[Dict[str, Any]],
+                       kit: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Fix brand mishearings in caption words from the kit's ``vocab``.
+
+    ``vocab`` is ``"Canon=alias1|alias2,word,..."`` — WhisperX commonly hears
+    "Counza" as "cancer"/"Canza", so the alias maps the misheard word back to the
+    canonical spelling on screen. Whole-word and case-insensitive; preserves
+    surrounding punctuation and an all-caps original. No-op when the kit defines
+    no aliases.
+    """
+    raw = str((kit or {}).get("vocab") or "")
+    if "=" not in raw:
+        return out_words
+    alias_map: Dict[str, str] = {}
+    for term in raw.split(","):
+        if "=" not in term:
+            continue
+        canon, _, aliases = term.partition("=")
+        canon = canon.strip()
+        for a in aliases.split("|"):
+            a = a.strip().lower()
+            if a:
+                alias_map[a] = canon
+    if not alias_map:
+        return out_words
+    import re as _re
+    for w in out_words:
+        txt = str(w.get("word", ""))
+        m = _re.match(r"^(\W*)(.*?)(\W*)$", txt, _re.DOTALL)
+        if not m:
+            continue
+        pre, core, post = m.group(1), m.group(2), m.group(3)
+        repl = alias_map.get(core.lower())
+        if repl:
+            if core.isupper():
+                repl = repl.upper()
+            w["word"] = pre + repl + post
+    return out_words
 
 
 # --------------------------------------------------------------------------- #
@@ -490,17 +573,22 @@ def encode_segment(
     out_path: str,
     *,
     punch: Optional[float],
+    grade: Optional[str] = None,
 ) -> None:
     """Extract one range, normalize to vertical (+ optional punch-in), polish audio.
 
     loudnorm is intentionally NOT applied here — it runs once in the final pass.
     Boundary 30 ms fades ARE applied per segment so concatenated seams never pop.
+    ``grade`` is an optional ffmpeg colour-filter string (from a style preset /
+    helpers.grade); applied to the normalized frame, before the punch crop, so
+    every segment carries the look and the concat stays consistent.
     """
     start, end = rng["start"], rng["end"]
     dur = end - start
 
     vf = transforms.compose([
         transforms.normalize_vertical(src_w, src_h),
+        grade or "",
         transforms.punch_in(punch) if punch and punch > 1.0 else "",
     ])
 
@@ -612,6 +700,163 @@ def concat_segments(seg_paths: List[str], out_path: str, tmpdir: str) -> None:
     cmd = _common_video_out(cmd)
     cmd += [out_path]
     _run(cmd, what="concat (filter re-encode)")
+
+
+def apply_style_sfx(
+    in_path: str,
+    seam_times: List[float],
+    sfx_cfg: Optional[Dict[str, Any]],
+    tmpdir: str,
+) -> str:
+    """Mix a style's SFX cue at each internal cut seam; return a new path.
+
+    ``seam_times`` are the internal cut times on the OUTPUT timeline (already
+    overlap-adjusted when transitions shorten the timeline, so cues land on the
+    real seams). A no-op (returns ``in_path``) when SFX is off, effects.sfx is
+    unavailable, or there are no internal seams. Audio-only — safe on a
+    spoken_only face reel. Failures degrade to the un-sfx'd input.
+    """
+    if _sfx is None or not sfx_cfg:
+        return in_path
+    intensity = str(sfx_cfg.get("intensity") or "off").lower()
+    if intensity == "off" or not seam_times:
+        return in_path
+    gain = _sfx.INTENSITY_GAIN_DB.get(intensity, -12)
+    if gain is None:
+        return in_path
+
+    cues = list(sfx_cfg.get("cues") or ["whoosh"])
+    cut_cue = "whoosh" if "whoosh" in cues else (cues[0] if cues else "whoosh")
+    # seam_times are already the internal cuts (no leading 0) -> no skip_first.
+    events = _sfx.events_from_cuts(list(seam_times), cue=cut_cue, skip_first=False)
+    if not events:
+        return in_path
+
+    try:
+        lib = _sfx.build_cue_library(os.path.join(tmpdir, "sfx_cache"), names=[cut_cue])
+        mix = _sfx.build_sfx_mix(events, lib, gain_db=float(gain))
+        if not mix.filtergraph or mix.n_cues == 0:
+            return in_path
+        out_path = os.path.join(tmpdir, "with_sfx.mp4")
+        cmd = [
+            FFMPEG, "-y", "-i", in_path, *mix.inputs,
+            "-filter_complex", mix.filtergraph,
+            "-map", "0:v:0", "-map", mix.out_label,
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out_path,
+        ]
+        _run(cmd, what=f"style sfx ({intensity}: {len(events)} '{cut_cue}')")
+    except BuildError as exc:
+        print(f"[build_short] sfx mix skipped ({exc})", file=sys.stderr)
+        return in_path
+    print(f"[build_short] style sfx: {len(events)} '{cut_cue}' cue(s) at cuts "
+          f"(gain {gain}dB)", file=sys.stderr)
+    return out_path
+
+
+# Map a style transition name to an ffmpeg xfade transition.
+_XFADE_MAP = {
+    "zoom": "zoomin", "zoomin": "zoomin",
+    "whip": "slideleft", "whip_pan": "slideleft",
+    "dissolve": "fade", "fade": "fade", "crossfade": "fade",
+    "fade_through_black": "fadeblack", "fadeblack": "fadeblack",
+}
+
+
+def plan_transitions(
+    seg_durations: List[float],
+    style_transition: Optional[Dict[str, Any]],
+) -> Tuple[List[Optional[Dict[str, Any]]], List[float]]:
+    """Decide which seams get an xfade. Returns (plan, seam_overlaps).
+
+    ``plan[i]`` is ``{"type","dur"}`` for an xfade at seam i (between segment i
+    and i+1) or ``None`` for a hard cut. ``seam_overlaps[i]`` is the matching
+    overlap in seconds (0 for hard cuts) — the SAME numbers fed to
+    :func:`map_words_to_output` so captions stay in sync.
+
+    Selection is deterministic (no RNG): an even ``frequency`` fraction of seams,
+    and transitioned seams are never adjacent (a transition fuses its pair, so
+    the next seam is forced to a hard cut). A seam whose segments are too short
+    to host the xfade is demoted to a hard cut.
+    """
+    seams = max(0, len(seg_durations) - 1)
+    plan: List[Optional[Dict[str, Any]]] = [None] * seams
+    overlaps: List[float] = [0.0] * seams
+    if seams < 1 or not isinstance(style_transition, dict):
+        return plan, overlaps
+
+    raw = str(style_transition.get("default") or "hard_cut").lower()
+    if raw in ("hard_cut", "hard", "none", ""):
+        return plan, overlaps
+    ttype = _XFADE_MAP.get(raw, "fade")
+    freq = float(style_transition.get("frequency", 1.0) or 0.0)
+    dur = float(style_transition.get("duration_s", 0.3) or 0.3)
+    if freq <= 0.0 or dur <= 0.0:
+        return plan, overlaps
+
+    i = 0
+    while i < seams:
+        # Even selection: pick seam i when the freq-ramp crosses an integer.
+        if int((i + 1) * freq) > int(i * freq):
+            d = min(dur, 0.5 * seg_durations[i], 0.5 * seg_durations[i + 1])
+            if d >= 0.12:
+                plan[i] = {"type": ttype, "dur": round(d, 3)}
+                overlaps[i] = round(d, 3)
+                i += 2  # fused pair -> next seam is forced hard (non-adjacent)
+                continue
+        i += 1
+    return plan, overlaps
+
+
+def _render_xfade_pair(
+    seg_a: str, seg_b: str, dur_a: float, spec: Dict[str, Any],
+    tmpdir: str, idx: int,
+) -> str:
+    """Fuse two segments with an xfade (video) + acrossfade (audio).
+
+    The xfade offset is ``dur_a - d`` so the outgoing tail overlaps the incoming
+    head; output length is ``dur_a + dur_b - d``. Same encode params as the
+    segments so the result concats cleanly with un-fused clips.
+    """
+    d = float(spec["dur"])
+    ttype = str(spec["type"])
+    offset = max(0.0, float(dur_a) - d)
+    out_path = os.path.join(tmpdir, f"fused_{idx:03d}.mp4")
+    fc = (
+        f"[0:v][1:v]xfade=transition={ttype}:duration={d:.3f}:offset={offset:.3f}[v];"
+        f"[0:a][1:a]acrossfade=d={d:.3f}[a]"
+    )
+    cmd = [
+        FFMPEG, "-y", "-i", seg_a, "-i", seg_b,
+        "-filter_complex", fc, "-map", "[v]", "-map", "[a]",
+    ]
+    cmd = _common_video_out(cmd)
+    cmd += [out_path]
+    _run(cmd, what=f"xfade pair {idx} ({ttype}, {d:.2f}s)")
+    return out_path
+
+
+def concat_with_transitions(
+    seg_paths: List[str], seg_durations: List[float],
+    plan: List[Optional[Dict[str, Any]]], out_path: str, tmpdir: str,
+) -> None:
+    """Concat segments, fusing the planned seams with xfades first.
+
+    Falls back to a plain hard-cut concat when ``plan`` has no transitions.
+    """
+    if not any(plan):
+        concat_segments(seg_paths, out_path, tmpdir)
+        return
+    clips: List[str] = []
+    j, n = 0, len(seg_paths)
+    while j < n:
+        if j < n - 1 and plan[j] is not None:
+            clips.append(_render_xfade_pair(
+                seg_paths[j], seg_paths[j + 1], seg_durations[j], plan[j], tmpdir, j))
+            j += 2
+        else:
+            clips.append(seg_paths[j])
+            j += 1
+    concat_segments(clips, out_path, tmpdir)
 
 
 def final_pass(
@@ -736,6 +981,19 @@ def final_pass(
             )
             fc_parts.append(
                 f"[{prev}][{src}]overlay=x='{xexpr}':y=1450:"
+                f"enable='between(t,{at:.3f},{end:.3f})'[{lbl}]"
+            )
+        elif kind == "video":
+            # A moving B-roll clip (e.g. flux_morph). Reset its PTS and offset to
+            # the overlay window so it plays from its OWN frame 0 at `at` (without
+            # this it would show the middle of the clip / EOF). Full-frame cutaway,
+            # gated to its window; its audio is ignored (base audio stays master).
+            pre = f"vid{idx}"
+            fc_parts.append(
+                f"[{src}]setpts=PTS-STARTPTS+{at:.3f}/TB,setsar=1[{pre}]"
+            )
+            fc_parts.append(
+                f"[{prev}][{pre}]overlay=0:0:"
                 f"enable='between(t,{at:.3f},{end:.3f})'[{lbl}]"
             )
         else:
@@ -1452,6 +1710,71 @@ def build(args: argparse.Namespace) -> int:
         else:
             punch_default = 1.12
 
+    # --style: a reel "look" (engine/styles/<name>.json) layered over the brand
+    # kit + profile. A style sets grade + punch + caption preset + (later) sfx,
+    # but NEVER colours (identity stays in the brand kit) and NEVER on-screen
+    # text — so it is fully compatible with the spoken_only face-reel policy.
+    style_grade: Optional[str] = None
+    style_sfx: Optional[Dict[str, Any]] = None
+    style_transition: Optional[Dict[str, Any]] = None
+    style_name = getattr(args, "style", None)
+    if style_name:
+        if load_style is None:
+            print("[build_short] --style requested but engine/styles is "
+                  "unavailable; ignoring.", file=sys.stderr)
+        else:
+            try:
+                style = load_style(style_name)
+            except Exception as exc:
+                raise BuildError(
+                    f"--style {style_name!r}: {exc} "
+                    f"(available: {', '.join(available_styles()) or 'none'})"
+                ) from exc
+            # grade -> resolve the preset name to an ffmpeg filter string.
+            g = (style.get("grade") or {})
+            gp = g.get("preset") if isinstance(g, dict) else g
+            if gp and gp != "none":
+                if _grade is None:
+                    print("[build_short] style grade requested but helpers/grade "
+                          "is unavailable; skipping grade.", file=sys.stderr)
+                else:
+                    try:
+                        style_grade = _grade.get_preset(str(gp))
+                    except Exception as exc:
+                        print(f"[build_short] style grade {gp!r} skipped: {exc}",
+                              file=sys.stderr)
+            # punch -> override the profile default.
+            spin = style.get("punch_in")
+            if isinstance(spin, dict) and "pct" in spin:
+                try:
+                    punch_default = float(spin["pct"]) / 100.0
+                except (TypeError, ValueError):
+                    pass
+            # captions -> merge preset + NON-COLOUR overrides onto the brand kit's
+            # caption_style. Colours (fill/highlight/outline) stay from the kit.
+            scap = style.get("captions") or {}
+            cap_style = dict(kit.get("caption_style") or {})
+            if scap.get("preset"):
+                cap_style["preset"] = scap["preset"]
+            for k, v in (scap.get("overrides") or {}).items():
+                if k not in ("fill", "highlight", "outline"):
+                    cap_style[k] = v
+            kit["caption_style"] = cap_style
+            # sfx config -> applied at the cut seams after concat (audio only).
+            ssfx = style.get("sfx")
+            if isinstance(ssfx, dict):
+                style_sfx = ssfx
+            # transition config -> xfade on a fraction of the cut seams.
+            strans = style.get("transition")
+            if isinstance(strans, dict):
+                style_transition = strans
+            print(f"[build_short] style '{style_name}': grade="
+                  f"{(gp if style_grade else 'none')}, punch={punch_default}, "
+                  f"caption={cap_style.get('preset')}, "
+                  f"sfx={(style_sfx or {}).get('intensity', 'off')}, "
+                  f"transition={(style_transition or {}).get('default', 'hard_cut')}",
+                  file=sys.stderr)
+
     captions_cfg = profile.get("captions") or {}
     captions_on = bool(captions_cfg.get("on", True)) and bool(captions_cfg.get("animated", True))
 
@@ -1463,6 +1786,29 @@ def build(args: argparse.Namespace) -> int:
     cta_text = args.cta or kit_cta.get("text", "")
     if args.cta or args.keyword:
         cta_on = True  # explicit CLI copy forces the card on
+
+    # Face-reel added-text policy (engine/SURFACES.md): a profile marked
+    # "added_text": "spoken_only" (or cta.spoken_only) is a founder talking-head
+    # surface where the ONLY on-screen text may be spoken-word captions. Suppress
+    # every unspoken overlay — CTA endcard, hook card, lower-third/wordmark.
+    # Cards live on the product-video path (engine/templates/product_video.py),
+    # never on a face reel.
+    added_text = str(profile.get("added_text") or "").strip().lower()
+    spoken_only = added_text == "spoken_only" or bool(cta_profile.get("spoken_only", False))
+    if spoken_only:
+        if cta_on:
+            print("[build_short] spoken_only profile: suppressing CTA endcard "
+                  "(unspoken text not allowed on face reels; put the CTA in the "
+                  "post caption). See engine/SURFACES.md.", file=sys.stderr)
+        cta_on = False
+        if getattr(args, "hook_card", None):
+            print("[build_short] spoken_only profile: ignoring --hook-card "
+                  "(no title cards on face reels).", file=sys.stderr)
+            args.hook_card = None
+        if getattr(args, "lower_third", None):
+            print("[build_short] spoken_only profile: ignoring --lower-third "
+                  "(no name banners/wordmarks on face reels).", file=sys.stderr)
+            args.lower_third = None
 
     # 2) ranges + words on the output timeline.
     ranges = load_ranges(args.ranges, duration)
@@ -1477,9 +1823,12 @@ def build(args: argparse.Namespace) -> int:
         words = parse_transcript(tdata)
     else:
         words = load_transcript_for_source(source)
-    out_words = map_words_to_output(words, ranges, duration)
-    print(f"[build_short] {len(ranges)} range(s), {len(out_words)} caption word(s)",
-          file=sys.stderr)
+    # Transition plan first: it shortens the output timeline at each xfade seam,
+    # so the SAME overlaps must drive the caption map (kept in sync). The caption
+    # map itself is built AFTER encoding, off the ACTUAL segment durations.
+    seg_durations = [float(r["end"]) - float(r["start"]) for r in ranges]
+    trans_plan, seam_overlaps = plan_transitions(seg_durations, style_transition)
+    n_trans = sum(1 for t in trans_plan if t)
 
     # temp workspace
     stem = os.path.splitext(os.path.basename(source))[0]
@@ -1494,20 +1843,53 @@ def build(args: argparse.Namespace) -> int:
     for i, rng in enumerate(ranges):
         seg = os.path.join(tmpdir, f"seg_{i:03d}.mp4")
         punch = rng.get("zoom", punch_default)
-        encode_segment(source, rng, src_w, src_h, seg, punch=punch)
+        encode_segment(source, rng, src_w, src_h, seg, punch=punch, grade=style_grade)
         seg_paths.append(seg)
 
-    # 4) concat -> base.mp4
+    # 3b) caption map off ACTUAL encoded durations (ffmpeg frame-snaps segments a
+    #     touch longer than end-start; using nominal drifts captions over a
+    #     multi-cut reel). range_out_starts[k] = sum(actual durs before k) minus
+    #     the xfade overlaps before k.
+    actual_durs: List[float] = []
+    for seg in seg_paths:
+        try:
+            actual_durs.append(float(probe_video(seg)[2]))
+        except Exception:
+            actual_durs.append(0.0)
+    range_out_starts: List[float] = []
+    acc, ov = 0.0, 0.0
+    for k in range(len(ranges)):
+        range_out_starts.append(round(acc - ov, 4))
+        acc += actual_durs[k] if k < len(actual_durs) else 0.0
+        if k < len(seam_overlaps):
+            ov += max(0.0, float(seam_overlaps[k]))
+    out_words = map_words_to_output(words, ranges, duration,
+                                    range_out_starts=range_out_starts)
+    out_words = _apply_brand_vocab(out_words, kit)
+    print(f"[build_short] {len(ranges)} range(s), {len(out_words)} caption word(s)"
+          + (f", {n_trans} transition(s)" if n_trans else ""), file=sys.stderr)
+
+    # 4) concat -> base.mp4 (xfade the planned seams; plain concat otherwise).
     base = os.path.join(tmpdir, "base.mp4")
-    concat_segments(seg_paths, base, tmpdir)
+    concat_with_transitions(seg_paths, seg_durations, trans_plan, base, tmpdir)
     pre_caption = base
+
+    # 4b) style SFX: lay the style's cue at each internal cut seam (audio only,
+    #     no-op for a single take / sfx=off). Done on the base before any CTA so
+    #     the seam times line up with the footage segments. Internal cut times on
+    #     the OUTPUT timeline, overlap-adjusted so cues land on the real seams
+    #     even when transitions shortened the timeline.
+    # Each internal seam i is the output start of segment i+1 (already
+    # overlap- and actual-duration-adjusted in range_out_starts).
+    seam_times = [t for t in range_out_starts[1:] if t > 0.0]
+    pre_caption = apply_style_sfx(pre_caption, seam_times, style_sfx, tmpdir)
 
     # 5) optional CTA card appended after the base.
     if cta_on and (keyword or cta_text):
         card = os.path.join(tmpdir, "cta.mp4")
         encode_cta_card(kit, keyword, cta_text, card)
         withcta = os.path.join(tmpdir, "withcta.mp4")
-        concat_segments([base, card], withcta, tmpdir)
+        concat_segments([pre_caption, card], withcta, tmpdir)
         pre_caption = withcta
 
     # 6) animated captions (.ass) on the speech timeline (none over CTA card).
@@ -1529,13 +1911,81 @@ def build(args: argparse.Namespace) -> int:
     lt_overlays, lt_norm = resolve_lower_thirds(lt_spec, kit, tmpdir)
 
     images_spec = load_images_spec(args.images, args.ranges)
+    # --auto-broll: pull real footage/imagery for concept moments and append the
+    # inserts to the image spec (resolved through the same file-overlay path).
+    # Visual only (no on-screen text) -> safe on spoken_only face reels.
+    n_broll = int(getattr(args, "auto_broll", 0) or 0)
+    auto_video_overlays: List[Dict[str, Any]] = []
+    if n_broll > 0:
+        if _auto_broll is None:
+            print("[build_short] --auto-broll requested but engine/auto_broll is "
+                  "unavailable; skipping.", file=sys.stderr)
+        else:
+            # motion=True -> abstract concepts become free moving flux_morph clips.
+            broll = _auto_broll.auto_broll_specs(
+                out_words, duration, kit, max_inserts=n_broll,
+                out_dir=os.path.join(tmpdir, "assets"), motion=True,
+                reserve_start=2.0,   # never open on B-roll; let the face/hook land
+            )
+            if broll and spoken_only:
+                # Face reel: B-roll is allowed (it's visual) but its LABEL is
+                # unspoken text — strip it and show full-frame with no chip/caption.
+                for b in broll:
+                    b.pop("label", None)
+                    b["placement"] = "full"
+            if broll:
+                # Moving clips -> video overlays (setpts-timed); stills -> image path.
+                broll_videos = [b for b in broll if b.get("video")]
+                broll_images = [b for b in broll if not b.get("video")]
+                for b in broll_videos:
+                    auto_video_overlays.append({
+                        "kind": "video", "asset": b["file"],
+                        "at": float(b["at"]), "duration": float(b["duration"]),
+                    })
+                images_spec = list(images_spec) + broll_images
+                print(f"[build_short] auto-broll: {len(broll)} insert(s) at concept "
+                      f"moments ({len(broll_videos)} moving, {len(broll_images)} "
+                      f"still)", file=sys.stderr)
+            else:
+                print("[build_short] auto-broll: no concept moments resolved "
+                      "(no keys/assets?); continuing without.", file=sys.stderr)
+
+    # --broll: manually-verified full-bleed cutaways (PATH:AT:DUR). Images are
+    # wrapped in a free Ken Burns clip; videos used as-is. Composited full-frame.
+    for spec in (getattr(args, "broll", None) or []):
+        try:
+            path, at_s, dur_s = str(spec).rsplit(":", 2)
+            at_f, dur_f = float(at_s), float(dur_s)
+        except ValueError:
+            raise BuildError(f"--broll must be PATH:AT:DUR, got {spec!r}")
+        if not os.path.isfile(path):
+            raise BuildError(f"--broll asset not found: {path!r}")
+        ext = os.path.splitext(path)[1].lower()
+        clip = path
+        if ext not in (".mp4", ".mov", ".m4v", ".webm", ".mkv"):
+            # an image -> full-bleed Ken Burns clip (no border)
+            if 'video_gen' in sys.modules or _auto_broll is not None:
+                import video_gen as _vg
+                clip = _vg.gen_video(image=path, out_dir=os.path.join(tmpdir, "assets"),
+                                     duration=dur_f, width=1080, height=1920,
+                                     seed=int(at_f * 10) % 100000, backend="kenburns")
+            if not clip or not os.path.isfile(clip):
+                print(f"[build_short] --broll: could not build clip for {path!r}; "
+                      "skipping.", file=sys.stderr)
+                continue
+        auto_video_overlays.append({"kind": "video", "asset": clip,
+                                    "at": at_f, "duration": dur_f})
+        print(f"[build_short] --broll: verified cutaway {os.path.basename(path)} "
+              f"@ {at_f:.1f}s for {dur_f:.1f}s", file=sys.stderr)
+
     img_overlays, images_norm = resolve_images(
         images_spec, kit, os.path.dirname(source), tmpdir
     )
     logo_row_overlays = [o for o in img_overlays if o.get("kind") == "logo_row"]
     single_overlays = [o for o in img_overlays if o.get("kind") != "logo_row"]
 
-    overlays = hook_overlays + logo_row_overlays + lt_overlays + single_overlays
+    overlays = (hook_overlays + logo_row_overlays + lt_overlays
+                + single_overlays + auto_video_overlays)
     if overlays:
         print(f"[build_short] overlays: {len(hook_overlays)} hook card, "
               f"{len(logo_row_overlays)} logo row(s), {len(lt_overlays)} "
@@ -1611,6 +2061,25 @@ def build_parser() -> argparse.ArgumentParser:
                    help="brand kit name (engine/brandkits/<name>.json)")
     p.add_argument("--profile", default="founder_edtech",
                    help="edit profile name (engine/profiles/<name>.json)")
+    p.add_argument("--style", default=None,
+                   help="reel style preset (engine/styles/<name>.json): "
+                        "clean_premium | dark_sizzle | founder_raw | "
+                        "hormozi_punch. Sets grade + punch + caption preset "
+                        "(never colours, never on-screen text — safe on face "
+                        "reels). Omit for the plain brand-kit look.")
+    p.add_argument("--auto-broll", type=int, default=0, metavar="N",
+                   help="auto-pull up to N real-footage cutaways (Pexels/Pixabay "
+                        "stock, school crests, or generated scenes) at concept "
+                        "moments in the transcript. Visual only (no on-screen "
+                        "text) so it's safe on face reels. Keep small (2-3) for "
+                        "talking-head; 0 = off.")
+    p.add_argument("--broll", action="append", default=None, metavar="PATH:AT:DUR",
+                   help="add ONE verified B-roll cutaway full-frame: a local "
+                        "image or video PATH, shown at output time AT for DUR "
+                        "seconds (e.g. cornell.jpg:11.5:2.2). Images are wrapped "
+                        "in a free full-bleed Ken Burns clip. Repeatable. Use this "
+                        "to insert only assets you've visually verified — unlike "
+                        "--auto-broll which fetches blind.")
     p.add_argument("--cta", default=None,
                    help="CTA line override (default: brandkit cta.text)")
     p.add_argument("--keyword", default=None,

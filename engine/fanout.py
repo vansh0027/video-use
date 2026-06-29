@@ -52,6 +52,8 @@ jobs.json schema
           "name": "counza",                 // REQUIRED — output subfolder name
           "brandkit": "counza",             // brand kit (default: account name)
           "profile": "founder_edtech",      // edit profile (default: founder_edtech)
+          "style": "dark_sizzle",           // reel style preset (optional): grade+punch+captions+sfx+transitions
+          "auto_broll": 2,                  // pull N real-footage cutaways at concept moments (optional)
           "cta": "Comment PROFILE for a free review", // CTA line override (optional)
           "keyword": "PROFILE",             // CTA keyword override (optional)
           "loop": true                      // seamless-loop the output (optional)
@@ -193,6 +195,8 @@ def load_jobs(jobs_path: str) -> Dict[str, Any]:
             "slug": slug,
             "brandkit": acc.get("brandkit") or name,
             "profile": acc.get("profile") or "founder_edtech",
+            "style": acc.get("style"),
+            "auto_broll": int(acc.get("auto_broll", 0) or 0),
             "cta": acc.get("cta"),
             "keyword": acc.get("keyword"),
             "loop": bool(acc.get("loop", False)),
@@ -322,6 +326,8 @@ def run_job(
         "params": {
             "brandkit": account["brandkit"],
             "profile": account["profile"],
+            "style": account.get("style"),
+            "auto_broll": account.get("auto_broll", 0),
             "cta": account["cta"],
             "keyword": account["keyword"],
             "loop": account["loop"],
@@ -349,6 +355,10 @@ def run_job(
     # 2) assemble the build_short command.
     cmd = [_python_exe(), BUILD_SHORT, "--source", source, "-o", out_path,
            "--brandkit", account["brandkit"], "--profile", account["profile"]]
+    if account.get("style"):
+        cmd += ["--style", str(account["style"])]
+    if int(account.get("auto_broll", 0) or 0) > 0:
+        cmd += ["--auto-broll", str(int(account["auto_broll"]))]
     if transcript:
         cmd += ["--transcript", transcript]
     if ranges_path:

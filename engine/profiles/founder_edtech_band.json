@@ -11,6 +11,8 @@
   "captions": { "on": true, "animated": true, "max_words": 4, "highlight_keywords": true },
   "audio": { "lufs": -14, "true_peak": -1, "music_duck_db": -20 },
   "transitions": { "default": "hard_cut" },
-  "cta": { "on": true },
+  "cta": { "on": true, "spoken_only": true },
+  "added_text": "spoken_only",
+  "_added_text_note": "FACE-reel surface: spoken-word captions ONLY, no cards/wordmarks/CTA endcards. See engine/SURFACES.md.",
   "hook_frame_1": true
 }

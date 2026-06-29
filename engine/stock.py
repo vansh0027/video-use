@@ -48,6 +48,15 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
+# Load keys from the repo-root .env so PEXELS_API_KEY / PIXABAY_API_KEY are
+# honoured even when launched as a bare `python engine/stock.py` (no shell
+# sourcing). The real environment still wins. Never fatal if absent.
+try:
+    from _env import load_env as _load_env
+    _load_env()
+except Exception:  # pragma: no cover
+    pass
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------

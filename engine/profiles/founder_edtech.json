@@ -34,8 +34,12 @@
   },
 
   "cta": {
-    "on": true
+    "on": true,
+    "spoken_only": true
   },
+
+  "added_text": "spoken_only",
+  "_added_text_note": "FACE-reel surface: on-screen text must be spoken-word captions ONLY. No hook cards, stat/quote/CTA cards, wordmarks, titles, labels, or banners (engine/templates/* cards are for product videos, not face reels). The CTA is spoken or lives in the post caption, never an on-screen endcard. See engine/SURFACES.md.",
 
   "hook_frame_1": true
 }
