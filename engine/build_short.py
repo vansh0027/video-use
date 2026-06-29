@@ -1464,6 +1464,29 @@ def build(args: argparse.Namespace) -> int:
     if args.cta or args.keyword:
         cta_on = True  # explicit CLI copy forces the card on
 
+    # Face-reel added-text policy (engine/SURFACES.md): a profile marked
+    # "added_text": "spoken_only" (or cta.spoken_only) is a founder talking-head
+    # surface where the ONLY on-screen text may be spoken-word captions. Suppress
+    # every unspoken overlay — CTA endcard, hook card, lower-third/wordmark.
+    # Cards live on the product-video path (engine/templates/product_video.py),
+    # never on a face reel.
+    added_text = str(profile.get("added_text") or "").strip().lower()
+    spoken_only = added_text == "spoken_only" or bool(cta_profile.get("spoken_only", False))
+    if spoken_only:
+        if cta_on:
+            print("[build_short] spoken_only profile: suppressing CTA endcard "
+                  "(unspoken text not allowed on face reels; put the CTA in the "
+                  "post caption). See engine/SURFACES.md.", file=sys.stderr)
+        cta_on = False
+        if getattr(args, "hook_card", None):
+            print("[build_short] spoken_only profile: ignoring --hook-card "
+                  "(no title cards on face reels).", file=sys.stderr)
+            args.hook_card = None
+        if getattr(args, "lower_third", None):
+            print("[build_short] spoken_only profile: ignoring --lower-third "
+                  "(no name banners/wordmarks on face reels).", file=sys.stderr)
+            args.lower_third = None
+
     # 2) ranges + words on the output timeline.
     ranges = load_ranges(args.ranges, duration)
     if args.transcript:
