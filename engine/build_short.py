@@ -111,6 +111,13 @@ import motiongfx  # noqa: E402    (animated hook card + lower-third graphics)
 import loop  # noqa: E402         (seamless end->start loop post-process)
 from loader import load_profile  # noqa: E402  (engine/profiles/loader.py)
 
+# Auto-B-roll (engine/auto_broll.py) is optional: --auto-broll is the only thing
+# that needs it, so a missing module degrades to "no auto b-roll".
+try:
+    import auto_broll as _auto_broll  # noqa: E402
+except Exception:  # pragma: no cover
+    _auto_broll = None
+
 # Style presets (engine/styles/) and the grade-preset filter strings
 # (helpers/grade.py) are optional: --style is the only thing that needs them, so
 # a missing module degrades to "no style" rather than breaking a plain render.
@@ -1697,6 +1704,34 @@ def build(args: argparse.Namespace) -> int:
     lt_overlays, lt_norm = resolve_lower_thirds(lt_spec, kit, tmpdir)
 
     images_spec = load_images_spec(args.images, args.ranges)
+    # --auto-broll: pull real footage/imagery for concept moments and append the
+    # inserts to the image spec (resolved through the same file-overlay path).
+    # Visual only (no on-screen text) -> safe on spoken_only face reels.
+    n_broll = int(getattr(args, "auto_broll", 0) or 0)
+    if n_broll > 0:
+        if _auto_broll is None:
+            print("[build_short] --auto-broll requested but engine/auto_broll is "
+                  "unavailable; skipping.", file=sys.stderr)
+        else:
+            broll = _auto_broll.auto_broll_specs(
+                out_words, duration, kit, max_inserts=n_broll,
+                out_dir=os.path.join(tmpdir, "assets"),
+            )
+            if broll and spoken_only:
+                # Face reel: B-roll is allowed (it's visual) but its LABEL is
+                # unspoken text — strip it and show the footage full-frame with
+                # no chip/caption, per the spoken_only policy (SURFACES.md).
+                for b in broll:
+                    b.pop("label", None)
+                    b["placement"] = "full"
+            if broll:
+                labels = ", ".join(str(b.get("label") or "image")[:24] for b in broll)
+                print(f"[build_short] auto-broll: {len(broll)} real-footage "
+                      f"insert(s) at concept moments ({labels})", file=sys.stderr)
+                images_spec = list(images_spec) + broll
+            else:
+                print("[build_short] auto-broll: no concept moments resolved "
+                      "(no keys/assets?); continuing without.", file=sys.stderr)
     img_overlays, images_norm = resolve_images(
         images_spec, kit, os.path.dirname(source), tmpdir
     )
@@ -1785,6 +1820,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "hormozi_punch. Sets grade + punch + caption preset "
                         "(never colours, never on-screen text — safe on face "
                         "reels). Omit for the plain brand-kit look.")
+    p.add_argument("--auto-broll", type=int, default=0, metavar="N",
+                   help="auto-pull up to N real-footage cutaways (Pexels/Pixabay "
+                        "stock, school crests, or generated scenes) at concept "
+                        "moments in the transcript. Visual only (no on-screen "
+                        "text) so it's safe on face reels. Keep small (2-3) for "
+                        "talking-head; 0 = off.")
     p.add_argument("--cta", default=None,
                    help="CTA line override (default: brandkit cta.text)")
     p.add_argument("--keyword", default=None,
