@@ -405,6 +405,7 @@ def map_words_to_output(
     ranges: List[Dict[str, float]],
     duration: float,
     seam_overlaps: Optional[List[float]] = None,
+    range_out_starts: Optional[List[float]] = None,
 ) -> List[Dict[str, Any]]:
     """Project source-time words onto the OUTPUT timeline.
 
@@ -441,6 +442,11 @@ def map_words_to_output(
     offset = 0.0
     for idx, rng in enumerate(ranges):
         rs, re_ = rng["start"], rng["end"]
+        # Prefer the caller's measured output start for this range (from ACTUAL
+        # encoded segment durations) — ffmpeg frame-snaps segments a touch longer
+        # than (end-start), so nominal offsets drift over a multi-cut reel.
+        if range_out_starts is not None and idx < len(range_out_starts):
+            offset = float(range_out_starts[idx])
         for w in words:
             # overlap test against [rs, re_)
             if w["end"] <= rs or w["start"] >= re_:
@@ -454,12 +460,53 @@ def map_words_to_output(
                 "start": ws - rs + offset,
                 "end": we - rs + offset,
             })
-        offset += (re_ - rs)
-        # An xfade at this seam pulls every later range earlier by its overlap.
-        if seam_overlaps and idx < len(seam_overlaps):
-            offset -= max(0.0, float(seam_overlaps[idx]))
+        if range_out_starts is None:
+            offset += (re_ - rs)
+            # An xfade at this seam pulls every later range earlier by its overlap.
+            if seam_overlaps and idx < len(seam_overlaps):
+                offset -= max(0.0, float(seam_overlaps[idx]))
     mapped.sort(key=lambda w: w["start"])
     return mapped
+
+
+def _apply_brand_vocab(out_words: List[Dict[str, Any]],
+                       kit: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Fix brand mishearings in caption words from the kit's ``vocab``.
+
+    ``vocab`` is ``"Canon=alias1|alias2,word,..."`` — WhisperX commonly hears
+    "Counza" as "cancer"/"Canza", so the alias maps the misheard word back to the
+    canonical spelling on screen. Whole-word and case-insensitive; preserves
+    surrounding punctuation and an all-caps original. No-op when the kit defines
+    no aliases.
+    """
+    raw = str((kit or {}).get("vocab") or "")
+    if "=" not in raw:
+        return out_words
+    alias_map: Dict[str, str] = {}
+    for term in raw.split(","):
+        if "=" not in term:
+            continue
+        canon, _, aliases = term.partition("=")
+        canon = canon.strip()
+        for a in aliases.split("|"):
+            a = a.strip().lower()
+            if a:
+                alias_map[a] = canon
+    if not alias_map:
+        return out_words
+    import re as _re
+    for w in out_words:
+        txt = str(w.get("word", ""))
+        m = _re.match(r"^(\W*)(.*?)(\W*)$", txt, _re.DOTALL)
+        if not m:
+            continue
+        pre, core, post = m.group(1), m.group(2), m.group(3)
+        repl = alias_map.get(core.lower())
+        if repl:
+            if core.isupper():
+                repl = repl.upper()
+            w["word"] = pre + repl + post
+    return out_words
 
 
 # --------------------------------------------------------------------------- #
@@ -1764,13 +1811,11 @@ def build(args: argparse.Namespace) -> int:
     else:
         words = load_transcript_for_source(source)
     # Transition plan first: it shortens the output timeline at each xfade seam,
-    # so the SAME overlaps must drive the caption map (kept in sync).
+    # so the SAME overlaps must drive the caption map (kept in sync). The caption
+    # map itself is built AFTER encoding, off the ACTUAL segment durations.
     seg_durations = [float(r["end"]) - float(r["start"]) for r in ranges]
     trans_plan, seam_overlaps = plan_transitions(seg_durations, style_transition)
     n_trans = sum(1 for t in trans_plan if t)
-    out_words = map_words_to_output(words, ranges, duration, seam_overlaps)
-    print(f"[build_short] {len(ranges)} range(s), {len(out_words)} caption word(s)"
-          + (f", {n_trans} transition(s)" if n_trans else ""), file=sys.stderr)
 
     # temp workspace
     stem = os.path.splitext(os.path.basename(source))[0]
@@ -1788,6 +1833,29 @@ def build(args: argparse.Namespace) -> int:
         encode_segment(source, rng, src_w, src_h, seg, punch=punch, grade=style_grade)
         seg_paths.append(seg)
 
+    # 3b) caption map off ACTUAL encoded durations (ffmpeg frame-snaps segments a
+    #     touch longer than end-start; using nominal drifts captions over a
+    #     multi-cut reel). range_out_starts[k] = sum(actual durs before k) minus
+    #     the xfade overlaps before k.
+    actual_durs: List[float] = []
+    for seg in seg_paths:
+        try:
+            actual_durs.append(float(probe_video(seg)[2]))
+        except Exception:
+            actual_durs.append(0.0)
+    range_out_starts: List[float] = []
+    acc, ov = 0.0, 0.0
+    for k in range(len(ranges)):
+        range_out_starts.append(round(acc - ov, 4))
+        acc += actual_durs[k] if k < len(actual_durs) else 0.0
+        if k < len(seam_overlaps):
+            ov += max(0.0, float(seam_overlaps[k]))
+    out_words = map_words_to_output(words, ranges, duration,
+                                    range_out_starts=range_out_starts)
+    out_words = _apply_brand_vocab(out_words, kit)
+    print(f"[build_short] {len(ranges)} range(s), {len(out_words)} caption word(s)"
+          + (f", {n_trans} transition(s)" if n_trans else ""), file=sys.stderr)
+
     # 4) concat -> base.mp4 (xfade the planned seams; plain concat otherwise).
     base = os.path.join(tmpdir, "base.mp4")
     concat_with_transitions(seg_paths, seg_durations, trans_plan, base, tmpdir)
@@ -1798,12 +1866,9 @@ def build(args: argparse.Namespace) -> int:
     #     the seam times line up with the footage segments. Internal cut times on
     #     the OUTPUT timeline, overlap-adjusted so cues land on the real seams
     #     even when transitions shortened the timeline.
-    seam_times: List[float] = []
-    acc, ov = 0.0, 0.0
-    for i in range(len(seg_durations) - 1):
-        acc += seg_durations[i]
-        ov += (seam_overlaps[i] if i < len(seam_overlaps) else 0.0)
-        seam_times.append(round(acc - ov, 4))
+    # Each internal seam i is the output start of segment i+1 (already
+    # overlap- and actual-duration-adjusted in range_out_starts).
+    seam_times = [t for t in range_out_starts[1:] if t > 0.0]
     pre_caption = apply_style_sfx(pre_caption, seam_times, style_sfx, tmpdir)
 
     # 5) optional CTA card appended after the base.
