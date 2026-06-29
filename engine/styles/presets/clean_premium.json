@@ -1,0 +1,55 @@
+{
+  "name": "clean_premium",
+  "description": "Brand-film look: sparse centered statement captions, a barely-there grade, slow tasteful punch-ins, and a light SFX touch. The 'expensive and calm' aesthetic — minimal motion, lets the subject and the words carry it.",
+
+  "grade": {
+    "preset": "subtle",
+    "notes": "subtle = eq=contrast=1.03:saturation=0.98. Almost imperceptible cleanup, no color shift. Premium reads as natural, not graded."
+  },
+
+  "captions": {
+    "preset": "clean_twoline",
+    "overrides": {
+      "uppercase": false,
+      "max_words": 5,
+      "animate": true,
+      "margin_v": 820,
+      "size": 54,
+      "emphasize_numbers": false
+    },
+    "notes": "Centered short statement phrases, lowercase, gentle fade. NOT every word — only the line that matters. Place near vertical center, not the lower third."
+  },
+
+  "punch_in": {
+    "pct": 106,
+    "frames": 12,
+    "notes": "Slow, tasteful 6% push that ramps over ~12 frames. Use the animated punch on key statements; static elsewhere."
+  },
+
+  "pacing": {
+    "cut_cadence_s": 6.0,
+    "max_static_shot_s": 8.0,
+    "style": "slow",
+    "notes": "Let shots breathe. Long holds are fine when the line lands."
+  },
+
+  "transition": {
+    "default": "dissolve",
+    "frequency": 0.15,
+    "duration_s": 0.5,
+    "notes": "Hard cuts still dominate. A slow 0.5s cross-dissolve only at true section breaks."
+  },
+
+  "sfx": {
+    "intensity": "light",
+    "cues": ["whoosh"],
+    "notes": "A single soft whoosh under the occasional dissolve. Nothing percussive."
+  },
+
+  "music": {
+    "intensity": "light",
+    "duck_db": -22
+  },
+
+  "notes": "The Counza brand-film / 'founder on a sofa, beautifully lit' look. Restraint is the style: few captions, slow pushes, near-zero SFX. If in doubt, do less."
+}

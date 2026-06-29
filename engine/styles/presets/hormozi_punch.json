@@ -1,0 +1,55 @@
+{
+  "name": "hormozi_punch",
+  "description": "The Hormozi look: bold one-word-pop captions with keyword color emphasis, aggressive punch-ins, hard cuts only, and a pop SFX on the caption beat. Built for maximum retention on value/teaching content.",
+
+  "grade": {
+    "preset": "neutral_punch",
+    "notes": "neutral_punch = +6% contrast + a subtle S-curve, no color shift. Clean and punchy without going cinematic — the words are the star, the picture just needs to read crisp."
+  },
+
+  "captions": {
+    "preset": "oneword_pop",
+    "overrides": {
+      "uppercase": true,
+      "animate": true,
+      "size": 112,
+      "margin_v": 700,
+      "bold": true,
+      "highlight_keywords": true,
+      "emphasize_numbers": true
+    },
+    "notes": "Giant bold single words, pop-in, with keywords and every number in the accent color. This caption style IS the format — it carries the whole retention mechanic."
+  },
+
+  "punch_in": {
+    "pct": 116,
+    "frames": 2,
+    "notes": "Aggressive 16% punch landing in 2 frames on nearly every cut — a hard snap that keeps the eye moving."
+  },
+
+  "pacing": {
+    "cut_cadence_s": 2.2,
+    "max_static_shot_s": 3.0,
+    "style": "hard",
+    "notes": "Fast, relentless hard cuts. Remove every dead beat. Cut on the punctuation of speech."
+  },
+
+  "transition": {
+    "default": "hard_cut",
+    "frequency": 0.0,
+    "notes": "HARD CUTS ONLY. The Hormozi style is defined by its complete absence of fancy transitions — the cut itself is the rhythm."
+  },
+
+  "sfx": {
+    "intensity": "medium",
+    "cues": ["pop"],
+    "notes": "A tight pop on the keyword caption beats. No risers or whooshes — those belong to the sizzle look, not this one."
+  },
+
+  "music": {
+    "intensity": "medium",
+    "duck_db": -16
+  },
+
+  "notes": "The value/teaching retention format. Distinct from dark_sizzle: same one-word captions, but NO transitions (hard cuts only) and a cleaner neutral_punch grade instead of a cinematic one. The energy comes from caption pace + punch-in + pops, not from dissolves or color."
+}

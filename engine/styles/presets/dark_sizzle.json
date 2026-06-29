@@ -1,0 +1,55 @@
+{
+  "name": "dark_sizzle",
+  "description": "The 'Mayya' sizzle look: dark high-contrast grade, one-word-pop captions, fast cuts, riser/whoosh SFX, and zoom transitions. High energy, made to stop the scroll. Maximalist motion.",
+
+  "grade": {
+    "preset": "warm_cinematic",
+    "notes": "warm_cinematic = +12% contrast, crushed blacks, -12% sat, warm shadows / cool highs, filmic curve. The closest built-in to a moody, cinematic, high-contrast sizzle grade."
+  },
+
+  "captions": {
+    "preset": "oneword_pop",
+    "overrides": {
+      "uppercase": true,
+      "animate": true,
+      "size": 104,
+      "margin_v": 620,
+      "highlight_keywords": true,
+      "emphasize_numbers": true
+    },
+    "notes": "ONE big word at a time, pop-scale in, keywords + numbers tinted to the brand accent. Drives the relentless pace."
+  },
+
+  "punch_in": {
+    "pct": 114,
+    "frames": 3,
+    "notes": "Snappy 14% punch on nearly every cut — a hard, fast push that adds kinetic energy."
+  },
+
+  "pacing": {
+    "cut_cadence_s": 1.8,
+    "max_static_shot_s": 2.5,
+    "style": "montage",
+    "notes": "Fast. Cut on the beat, change the frame constantly, never let a shot sit."
+  },
+
+  "transition": {
+    "default": "zoom",
+    "frequency": 0.4,
+    "duration_s": 0.3,
+    "notes": "Zoom-in blend on a meaningful share of cuts (still let ~60% stay hard). Pairs with a riser SFX. Occasional whip_pan for direction changes."
+  },
+
+  "sfx": {
+    "intensity": "heavy",
+    "cues": ["riser", "whoosh", "impact"],
+    "notes": "Riser leads into a punch cut, whoosh on whip-pans, impact lands on the hardest hits. This is the signature of the look — lean in."
+  },
+
+  "music": {
+    "intensity": "heavy",
+    "duck_db": -14
+  },
+
+  "notes": "The high-energy, dark, fast-cut sizzle reel (the Mayya aesthetic). Everything is turned up: grade, pace, SFX, transitions. Best for hype/launch/announcement content, NOT for calm storytelling."
+}
