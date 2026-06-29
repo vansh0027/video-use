@@ -131,6 +131,7 @@ def auto_broll_specs(
     out_dir: str = ".",
     placement: str = "full",
     motion: bool = False,
+    reserve_start: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """Return overlay specs (``source:"file"``) for concept moments.
 
@@ -170,9 +171,14 @@ def auto_broll_specs(
     os.makedirs(out_dir, exist_ok=True)
     for beat in _select_beats(beats, max_inserts):
         b_start = float(beat["start"])
-        b_len = max(0.0, float(beat["end"]) - b_start)
-        # Sit the cutaway near the start of its beat, never longer than the beat.
-        dur = max(0.8, min(float(insert_dur), b_len if b_len > 0 else float(insert_dur)))
+        b_end = float(beat["end"])
+        # BUG FIX: never open the reel on B-roll — push the insert past the
+        # reserved opening window (the face/hook must land first). Skip the beat
+        # if there isn't room left after reserving.
+        at = max(b_start, float(reserve_start))
+        if b_end - at < 0.6:
+            continue
+        dur = max(0.8, min(float(insert_dur), b_end - at))
 
         is_video = False
         path = None
@@ -182,22 +188,39 @@ def auto_broll_specs(
                 clip = _video_gen.gen_video(
                     prompt=str(beat.get("query") or ""), out_dir=out_dir,
                     duration=round(dur, 3), width=_W, height=_H,
-                    seed=int(round(b_start * 10)) % 100000, backend="flux_morph",
+                    seed=int(round(at * 10)) % 100000, backend="flux_morph",
                 )
                 if clip and os.path.isfile(clip):
                     path, is_video = clip, True
             except Exception:
                 path = None
         if not path:
-            path = _resolve_asset(beat, out_dir)   # still fallback
-        if not path:
-            continue
+            still = _resolve_asset(beat, out_dir)
+            if not still:
+                continue
+            # BUG FIX: a "full" cutaway must be full-bleed, not a bordered concept
+            # card. Wrap the still in a free full-frame Ken Burns clip (subtle
+            # motion, edge-to-edge) instead of routing it through image_overlay's
+            # framed-card path.
+            if motion and _video_gen is not None:
+                try:
+                    kb = _video_gen.gen_video(
+                        image=still, out_dir=out_dir, duration=round(dur, 3),
+                        width=_W, height=_H, seed=int(round(at * 10)) % 100000,
+                        backend="kenburns",
+                    )
+                    if kb and os.path.isfile(kb):
+                        path, is_video = kb, True
+                except Exception:
+                    path = None
+            if not path:
+                path, is_video = still, False   # last resort: framed still
 
         specs.append({
             "source": "file",
             "file": path,
             "video": is_video,
-            "at": round(b_start, 3),
+            "at": round(at, 3),
             "duration": round(dur, 3),
             "placement": ("full" if is_video else
                           ("under_caption" if beat.get("kind") == "logos" else placement)),

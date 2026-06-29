@@ -1925,6 +1925,7 @@ def build(args: argparse.Namespace) -> int:
             broll = _auto_broll.auto_broll_specs(
                 out_words, duration, kit, max_inserts=n_broll,
                 out_dir=os.path.join(tmpdir, "assets"), motion=True,
+                reserve_start=2.0,   # never open on B-roll; let the face/hook land
             )
             if broll and spoken_only:
                 # Face reel: B-roll is allowed (it's visual) but its LABEL is
@@ -1948,6 +1949,35 @@ def build(args: argparse.Namespace) -> int:
             else:
                 print("[build_short] auto-broll: no concept moments resolved "
                       "(no keys/assets?); continuing without.", file=sys.stderr)
+
+    # --broll: manually-verified full-bleed cutaways (PATH:AT:DUR). Images are
+    # wrapped in a free Ken Burns clip; videos used as-is. Composited full-frame.
+    for spec in (getattr(args, "broll", None) or []):
+        try:
+            path, at_s, dur_s = str(spec).rsplit(":", 2)
+            at_f, dur_f = float(at_s), float(dur_s)
+        except ValueError:
+            raise BuildError(f"--broll must be PATH:AT:DUR, got {spec!r}")
+        if not os.path.isfile(path):
+            raise BuildError(f"--broll asset not found: {path!r}")
+        ext = os.path.splitext(path)[1].lower()
+        clip = path
+        if ext not in (".mp4", ".mov", ".m4v", ".webm", ".mkv"):
+            # an image -> full-bleed Ken Burns clip (no border)
+            if 'video_gen' in sys.modules or _auto_broll is not None:
+                import video_gen as _vg
+                clip = _vg.gen_video(image=path, out_dir=os.path.join(tmpdir, "assets"),
+                                     duration=dur_f, width=1080, height=1920,
+                                     seed=int(at_f * 10) % 100000, backend="kenburns")
+            if not clip or not os.path.isfile(clip):
+                print(f"[build_short] --broll: could not build clip for {path!r}; "
+                      "skipping.", file=sys.stderr)
+                continue
+        auto_video_overlays.append({"kind": "video", "asset": clip,
+                                    "at": at_f, "duration": dur_f})
+        print(f"[build_short] --broll: verified cutaway {os.path.basename(path)} "
+              f"@ {at_f:.1f}s for {dur_f:.1f}s", file=sys.stderr)
+
     img_overlays, images_norm = resolve_images(
         images_spec, kit, os.path.dirname(source), tmpdir
     )
@@ -2043,6 +2073,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "moments in the transcript. Visual only (no on-screen "
                         "text) so it's safe on face reels. Keep small (2-3) for "
                         "talking-head; 0 = off.")
+    p.add_argument("--broll", action="append", default=None, metavar="PATH:AT:DUR",
+                   help="add ONE verified B-roll cutaway full-frame: a local "
+                        "image or video PATH, shown at output time AT for DUR "
+                        "seconds (e.g. cornell.jpg:11.5:2.2). Images are wrapped "
+                        "in a free full-bleed Ken Burns clip. Repeatable. Use this "
+                        "to insert only assets you've visually verified — unlike "
+                        "--auto-broll which fetches blind.")
     p.add_argument("--cta", default=None,
                    help="CTA line override (default: brandkit cta.text)")
     p.add_argument("--keyword", default=None,
