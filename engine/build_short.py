@@ -404,6 +404,7 @@ def map_words_to_output(
     words: List[Dict[str, Any]],
     ranges: List[Dict[str, float]],
     duration: float,
+    seam_overlaps: Optional[List[float]] = None,
 ) -> List[Dict[str, Any]]:
     """Project source-time words onto the OUTPUT timeline.
 
@@ -413,6 +414,12 @@ def map_words_to_output(
       and offset each word so its time is measured from the start of the
       concatenated output:  out_t = w_t - range.start + range_offset, where
       range_offset is the cumulative length of all earlier ranges.
+
+    ``seam_overlaps`` (len ``len(ranges)-1``) makes the map transition-aware:
+    when seam i is an xfade of ``d`` seconds, range i+1 (and everything after)
+    starts ``d`` earlier on the output timeline, because the xfade overlaps the
+    outgoing tail with the incoming head. Passing it keeps captions in sync with
+    a transitioned concat. ``None`` (the default) means plain hard-cut concat.
 
     A word straddling a range boundary is clipped to that range's bounds.
     """
@@ -432,7 +439,7 @@ def map_words_to_output(
 
     mapped: List[Dict[str, Any]] = []
     offset = 0.0
-    for rng in ranges:
+    for idx, rng in enumerate(ranges):
         rs, re_ = rng["start"], rng["end"]
         for w in words:
             # overlap test against [rs, re_)
@@ -448,6 +455,9 @@ def map_words_to_output(
                 "end": we - rs + offset,
             })
         offset += (re_ - rs)
+        # An xfade at this seam pulls every later range earlier by its overlap.
+        if seam_overlaps and idx < len(seam_overlaps):
+            offset -= max(0.0, float(seam_overlaps[idx]))
     mapped.sort(key=lambda w: w["start"])
     return mapped
 
@@ -647,37 +657,31 @@ def concat_segments(seg_paths: List[str], out_path: str, tmpdir: str) -> None:
 
 def apply_style_sfx(
     in_path: str,
-    seg_durations: List[float],
+    seam_times: List[float],
     sfx_cfg: Optional[Dict[str, Any]],
     tmpdir: str,
 ) -> str:
     """Mix a style's SFX cue at each internal cut seam; return a new path.
 
-    A no-op (returns ``in_path`` unchanged) when SFX is off, the effects.sfx
-    module is unavailable, or there are fewer than two segments (a single
-    continuous take has no cut to underline). Audio-only — never adds on-screen
-    text, so it is safe on a spoken_only face reel. Failures degrade to the
-    un-sfx'd input rather than aborting the render.
+    ``seam_times`` are the internal cut times on the OUTPUT timeline (already
+    overlap-adjusted when transitions shorten the timeline, so cues land on the
+    real seams). A no-op (returns ``in_path``) when SFX is off, effects.sfx is
+    unavailable, or there are no internal seams. Audio-only — safe on a
+    spoken_only face reel. Failures degrade to the un-sfx'd input.
     """
     if _sfx is None or not sfx_cfg:
         return in_path
     intensity = str(sfx_cfg.get("intensity") or "off").lower()
-    if intensity == "off" or len(seg_durations) < 2:
+    if intensity == "off" or not seam_times:
         return in_path
     gain = _sfx.INTENSITY_GAIN_DB.get(intensity, -12)
     if gain is None:
         return in_path
 
-    # Cut seams on the OUTPUT timeline = cumulative segment starts.
-    boundaries = [0.0]
-    acc = 0.0
-    for d in seg_durations[:-1]:
-        acc += float(d)
-        boundaries.append(acc)
-
     cues = list(sfx_cfg.get("cues") or ["whoosh"])
     cut_cue = "whoosh" if "whoosh" in cues else (cues[0] if cues else "whoosh")
-    events = _sfx.events_from_cuts(boundaries, cue=cut_cue, skip_first=True)
+    # seam_times are already the internal cuts (no leading 0) -> no skip_first.
+    events = _sfx.events_from_cuts(list(seam_times), cue=cut_cue, skip_first=False)
     if not events:
         return in_path
 
@@ -700,6 +704,112 @@ def apply_style_sfx(
     print(f"[build_short] style sfx: {len(events)} '{cut_cue}' cue(s) at cuts "
           f"(gain {gain}dB)", file=sys.stderr)
     return out_path
+
+
+# Map a style transition name to an ffmpeg xfade transition.
+_XFADE_MAP = {
+    "zoom": "zoomin", "zoomin": "zoomin",
+    "whip": "slideleft", "whip_pan": "slideleft",
+    "dissolve": "fade", "fade": "fade", "crossfade": "fade",
+    "fade_through_black": "fadeblack", "fadeblack": "fadeblack",
+}
+
+
+def plan_transitions(
+    seg_durations: List[float],
+    style_transition: Optional[Dict[str, Any]],
+) -> Tuple[List[Optional[Dict[str, Any]]], List[float]]:
+    """Decide which seams get an xfade. Returns (plan, seam_overlaps).
+
+    ``plan[i]`` is ``{"type","dur"}`` for an xfade at seam i (between segment i
+    and i+1) or ``None`` for a hard cut. ``seam_overlaps[i]`` is the matching
+    overlap in seconds (0 for hard cuts) — the SAME numbers fed to
+    :func:`map_words_to_output` so captions stay in sync.
+
+    Selection is deterministic (no RNG): an even ``frequency`` fraction of seams,
+    and transitioned seams are never adjacent (a transition fuses its pair, so
+    the next seam is forced to a hard cut). A seam whose segments are too short
+    to host the xfade is demoted to a hard cut.
+    """
+    seams = max(0, len(seg_durations) - 1)
+    plan: List[Optional[Dict[str, Any]]] = [None] * seams
+    overlaps: List[float] = [0.0] * seams
+    if seams < 1 or not isinstance(style_transition, dict):
+        return plan, overlaps
+
+    raw = str(style_transition.get("default") or "hard_cut").lower()
+    if raw in ("hard_cut", "hard", "none", ""):
+        return plan, overlaps
+    ttype = _XFADE_MAP.get(raw, "fade")
+    freq = float(style_transition.get("frequency", 1.0) or 0.0)
+    dur = float(style_transition.get("duration_s", 0.3) or 0.3)
+    if freq <= 0.0 or dur <= 0.0:
+        return plan, overlaps
+
+    i = 0
+    while i < seams:
+        # Even selection: pick seam i when the freq-ramp crosses an integer.
+        if int((i + 1) * freq) > int(i * freq):
+            d = min(dur, 0.5 * seg_durations[i], 0.5 * seg_durations[i + 1])
+            if d >= 0.12:
+                plan[i] = {"type": ttype, "dur": round(d, 3)}
+                overlaps[i] = round(d, 3)
+                i += 2  # fused pair -> next seam is forced hard (non-adjacent)
+                continue
+        i += 1
+    return plan, overlaps
+
+
+def _render_xfade_pair(
+    seg_a: str, seg_b: str, dur_a: float, spec: Dict[str, Any],
+    tmpdir: str, idx: int,
+) -> str:
+    """Fuse two segments with an xfade (video) + acrossfade (audio).
+
+    The xfade offset is ``dur_a - d`` so the outgoing tail overlaps the incoming
+    head; output length is ``dur_a + dur_b - d``. Same encode params as the
+    segments so the result concats cleanly with un-fused clips.
+    """
+    d = float(spec["dur"])
+    ttype = str(spec["type"])
+    offset = max(0.0, float(dur_a) - d)
+    out_path = os.path.join(tmpdir, f"fused_{idx:03d}.mp4")
+    fc = (
+        f"[0:v][1:v]xfade=transition={ttype}:duration={d:.3f}:offset={offset:.3f}[v];"
+        f"[0:a][1:a]acrossfade=d={d:.3f}[a]"
+    )
+    cmd = [
+        FFMPEG, "-y", "-i", seg_a, "-i", seg_b,
+        "-filter_complex", fc, "-map", "[v]", "-map", "[a]",
+    ]
+    cmd = _common_video_out(cmd)
+    cmd += [out_path]
+    _run(cmd, what=f"xfade pair {idx} ({ttype}, {d:.2f}s)")
+    return out_path
+
+
+def concat_with_transitions(
+    seg_paths: List[str], seg_durations: List[float],
+    plan: List[Optional[Dict[str, Any]]], out_path: str, tmpdir: str,
+) -> None:
+    """Concat segments, fusing the planned seams with xfades first.
+
+    Falls back to a plain hard-cut concat when ``plan`` has no transitions.
+    """
+    if not any(plan):
+        concat_segments(seg_paths, out_path, tmpdir)
+        return
+    clips: List[str] = []
+    j, n = 0, len(seg_paths)
+    while j < n:
+        if j < n - 1 and plan[j] is not None:
+            clips.append(_render_xfade_pair(
+                seg_paths[j], seg_paths[j + 1], seg_durations[j], plan[j], tmpdir, j))
+            j += 2
+        else:
+            clips.append(seg_paths[j])
+            j += 1
+    concat_segments(clips, out_path, tmpdir)
 
 
 def final_pass(
@@ -1546,6 +1656,7 @@ def build(args: argparse.Namespace) -> int:
     # text — so it is fully compatible with the spoken_only face-reel policy.
     style_grade: Optional[str] = None
     style_sfx: Optional[Dict[str, Any]] = None
+    style_transition: Optional[Dict[str, Any]] = None
     style_name = getattr(args, "style", None)
     if style_name:
         if load_style is None:
@@ -1593,10 +1704,16 @@ def build(args: argparse.Namespace) -> int:
             ssfx = style.get("sfx")
             if isinstance(ssfx, dict):
                 style_sfx = ssfx
+            # transition config -> xfade on a fraction of the cut seams.
+            strans = style.get("transition")
+            if isinstance(strans, dict):
+                style_transition = strans
             print(f"[build_short] style '{style_name}': grade="
                   f"{(gp if style_grade else 'none')}, punch={punch_default}, "
                   f"caption={cap_style.get('preset')}, "
-                  f"sfx={(style_sfx or {}).get('intensity', 'off')}", file=sys.stderr)
+                  f"sfx={(style_sfx or {}).get('intensity', 'off')}, "
+                  f"transition={(style_transition or {}).get('default', 'hard_cut')}",
+                  file=sys.stderr)
 
     captions_cfg = profile.get("captions") or {}
     captions_on = bool(captions_cfg.get("on", True)) and bool(captions_cfg.get("animated", True))
@@ -1646,9 +1763,14 @@ def build(args: argparse.Namespace) -> int:
         words = parse_transcript(tdata)
     else:
         words = load_transcript_for_source(source)
-    out_words = map_words_to_output(words, ranges, duration)
-    print(f"[build_short] {len(ranges)} range(s), {len(out_words)} caption word(s)",
-          file=sys.stderr)
+    # Transition plan first: it shortens the output timeline at each xfade seam,
+    # so the SAME overlaps must drive the caption map (kept in sync).
+    seg_durations = [float(r["end"]) - float(r["start"]) for r in ranges]
+    trans_plan, seam_overlaps = plan_transitions(seg_durations, style_transition)
+    n_trans = sum(1 for t in trans_plan if t)
+    out_words = map_words_to_output(words, ranges, duration, seam_overlaps)
+    print(f"[build_short] {len(ranges)} range(s), {len(out_words)} caption word(s)"
+          + (f", {n_trans} transition(s)" if n_trans else ""), file=sys.stderr)
 
     # temp workspace
     stem = os.path.splitext(os.path.basename(source))[0]
@@ -1666,16 +1788,23 @@ def build(args: argparse.Namespace) -> int:
         encode_segment(source, rng, src_w, src_h, seg, punch=punch, grade=style_grade)
         seg_paths.append(seg)
 
-    # 4) concat -> base.mp4
+    # 4) concat -> base.mp4 (xfade the planned seams; plain concat otherwise).
     base = os.path.join(tmpdir, "base.mp4")
-    concat_segments(seg_paths, base, tmpdir)
+    concat_with_transitions(seg_paths, seg_durations, trans_plan, base, tmpdir)
     pre_caption = base
 
     # 4b) style SFX: lay the style's cue at each internal cut seam (audio only,
     #     no-op for a single take / sfx=off). Done on the base before any CTA so
-    #     the seam times line up with the footage segments.
-    seg_durations = [float(r["end"]) - float(r["start"]) for r in ranges]
-    pre_caption = apply_style_sfx(pre_caption, seg_durations, style_sfx, tmpdir)
+    #     the seam times line up with the footage segments. Internal cut times on
+    #     the OUTPUT timeline, overlap-adjusted so cues land on the real seams
+    #     even when transitions shortened the timeline.
+    seam_times: List[float] = []
+    acc, ov = 0.0, 0.0
+    for i in range(len(seg_durations) - 1):
+        acc += seg_durations[i]
+        ov += (seam_overlaps[i] if i < len(seam_overlaps) else 0.0)
+        seam_times.append(round(acc - ov, 4))
+    pre_caption = apply_style_sfx(pre_caption, seam_times, style_sfx, tmpdir)
 
     # 5) optional CTA card appended after the base.
     if cta_on and (keyword or cta_text):
