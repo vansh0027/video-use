@@ -62,6 +62,15 @@ import time
 import urllib.parse
 from typing import Callable, Dict, Optional, Tuple
 
+# Load the repo-root .env so the cloud backends' keys (REPLICATE_API_TOKEN,
+# RUNWAY_API_KEY, KLING_API_KEY) are honoured without manual shell sourcing.
+# The real environment still wins. Never fatal if absent.
+try:
+    from _env import load_env as _load_env
+    _load_env()
+except Exception:  # pragma: no cover
+    pass
+
 try:
     import requests
 except Exception:  # pragma: no cover - requests is expected in the venv
