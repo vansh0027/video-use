@@ -682,6 +682,91 @@ def _download_and_accept(url: str, out_path: str, duration: float) -> Optional[s
 
 
 # --------------------------------------------------------------------------- #
+# Backend: flux_morph (FREE, generative — morph between several Flux stills)
+# --------------------------------------------------------------------------- #
+
+def _backend_flux_morph(
+    prompt: Optional[str], image: Optional[str], out_path: str,
+    width: int, height: int, duration: float, seed: int,
+    model: Optional[str] = None,
+) -> Optional[str]:
+    """Free *generative* clip: cross-dissolve several Flux stills of the concept.
+
+    Generates K stills from the prompt at different seeds (free via Pollinations/
+    Flux) and xfades between them with faint grain, so the clip visibly EVOLVES
+    rather than just panning one frame — ideal for abstract B-roll (plasma,
+    neural, energy fields). Free, and offline after the still fetch. Degrades to
+    kenburns when fewer than two stills resolve (e.g. no network). No paid API.
+    """
+    if not (shutil.which(_FFMPEG) or os.path.isfile(_FFMPEG)):
+        return None
+    if not prompt and not image:
+        return None
+    out_dir = os.path.dirname(out_path) or "."
+    fps = _DEFAULT_FPS
+
+    k = 3 if duration >= 3.0 else 2
+    stills: list = []
+    if image and os.path.isfile(image):
+        stills.append(os.path.abspath(image))
+    if prompt and image_gen is not None:
+        for i in range(max(0, k - len(stills))):
+            s = image_gen.gen_image(prompt, out_dir, width=width, height=height,
+                                    seed=seed + 101 + i)
+            if s and os.path.isfile(s):
+                stills.append(s)
+    if len(stills) < 2:
+        # Not enough to morph -> fall back to the single-still Ken Burns path.
+        return _backend_kenburns(prompt, (stills[0] if stills else None),
+                                 out_path, width, height, duration, seed)
+
+    n = len(stills)
+    xf = 0.7                                   # crossfade length (s)
+    seg = max(xf + 0.3, (duration + (n - 1) * xf) / n)   # per-still on-screen time
+    parts: list = []
+    inputs: list = []
+    for i, s in enumerate(stills):
+        inputs += ["-loop", "1", "-t", f"{seg:g}", "-i", s]
+        parts.append(
+            f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},fps={fps},setsar=1[v{i}]"
+        )
+    prev = "v0"
+    for i in range(1, n):
+        out_lbl = "vout" if i == n - 1 else f"x{i}"
+        offset = i * (seg - xf)
+        parts.append(
+            f"[{prev}][v{i}]xfade=transition=fade:duration={xf:.3f}:"
+            f"offset={offset:.3f}[{out_lbl}]"
+        )
+        prev = out_lbl
+    parts.append("[vout]noise=alls=6:allf=t,format=yuv420p,setsar=1[vfinal]")
+    fc = ";".join(parts)
+
+    cmd = [
+        _FFMPEG, "-y", *inputs,
+        "-filter_complex", fc, "-map", "[vfinal]",
+        "-r", str(fps),
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an",
+        out_path,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=_FFMPEG_TIMEOUT)
+    except Exception as exc:
+        print(f"[video_gen] flux_morph ffmpeg invocation failed: {exc}")
+        return None
+    if proc.returncode != 0:
+        print(f"[video_gen] flux_morph ffmpeg exited {proc.returncode}: "
+              f"{(proc.stderr or proc.stdout or '').strip()[-400:]}")
+        # Last resort: a Ken Burns clip on the first still still beats nothing.
+        return _backend_kenburns(prompt, stills[0], out_path,
+                                 width, height, duration, seed)
+    return _accept(out_path, duration)
+
+
+# --------------------------------------------------------------------------- #
 # Registry + public API
 # --------------------------------------------------------------------------- #
 
@@ -689,6 +774,7 @@ def _download_and_accept(url: str, out_path: str, duration: float) -> Optional[s
 #   (prompt, image, out_path, width, height, duration, seed, model) -> str|None
 _BACKENDS: Dict[str, Callable[..., Optional[str]]] = {
     "kenburns": _backend_kenburns,
+    "flux_morph": _backend_flux_morph,
     "svd": _backend_svd,
     "wan": _backend_wan,
     "replicate": _backend_replicate,
@@ -721,9 +807,11 @@ def gen_video(
         width:  Output width in pixels (default 1080).
         height: Output height in pixels (default 1920, i.e. 9:16 vertical).
         seed:   Reproducibility seed; if ``None``, defaults to 0.
-        backend: One of ``"kenburns"``, ``"svd"``, ``"wan"``, ``"replicate"``,
-            ``"runway"``, ``"kling"``. If ``None``, falls back to
-            ``$CZ_VIDEO_GEN_BACKEND`` then to ``"kenburns"``.
+        backend: One of ``"kenburns"`` (free, default), ``"flux_morph"`` (free,
+            generative — morph between Flux stills), ``"svd"``, ``"wan"``,
+            ``"replicate"``, ``"runway"``, ``"kling"``. If ``None``, falls back
+            to ``$CZ_VIDEO_GEN_BACKEND`` then to ``"kenburns"``. The two free
+            backends need no API key.
         model:  Optional model override passed to cloud/local backends (ignored
             by kenburns).
 

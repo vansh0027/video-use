@@ -37,24 +37,34 @@ then animates it.
 Selection precedence: `backend=` arg **>** `$CZ_VIDEO_GEN_BACKEND` **>**
 `kenburns`.
 
-| backend     | free? | key / bin needed                         | status                          |
-|-------------|-------|------------------------------------------|---------------------------------|
-| `kenburns`  | ✅ yes | none (local ffmpeg, offline)             | **working — DEFAULT**           |
-| `svd`       | ✅ yes | `CZ_SVD_BIN` (local model binary)        | stub — returns None if unset    |
-| `wan`       | ✅ yes | `CZ_WAN_BIN` (local model binary)        | stub — returns None if unset    |
-| `replicate` | ❌ paid | `REPLICATE_API_TOKEN`                     | stub — wired submit+poll        |
-| `runway`    | ❌ paid | `RUNWAY_API_KEY`                          | stub — wired submit+poll        |
-| `kling`     | ❌ paid | `KLING_API_KEY`                          | stub — wired submit+poll        |
+| backend      | free? | key / bin needed                         | status                          |
+|--------------|-------|------------------------------------------|---------------------------------|
+| `kenburns`   | ✅ yes | none (local ffmpeg, offline)             | **working — DEFAULT**           |
+| `flux_morph` | ✅ yes | none (free Flux stills + ffmpeg)         | **working — free & generative** |
+| `svd`        | ✅ yes | `CZ_SVD_BIN` (local model binary)        | stub — returns None if unset    |
+| `wan`        | ✅ yes | `CZ_WAN_BIN` (local model binary)        | stub — returns None if unset    |
+| `replicate`  | ❌ paid | `REPLICATE_API_TOKEN`                     | stub — wired submit+poll (optional) |
+| `runway`     | ❌ paid | `RUNWAY_API_KEY`                          | stub — wired submit+poll (optional) |
+| `kling`      | ❌ paid | `KLING_API_KEY`                          | stub — wired submit+poll (optional) |
 
-**Cost / quality tradeoff.** `kenburns` is free, instant, fully offline, and
-gets you ~80% of the way — a still pushed/panned with `zoompan` plus a faint
-animated grain so it reads as *motion*, not a frozen zoom. The cloud backends
-(`replicate`/`runway`/`kling`) produce genuinely generated motion (true
-image-to-video diffusion) but cost credits per call and need network + a key.
-The local `svd`/`wan` backends are free once you supply your own compiled
-inference binary and model checkpoint (never downloaded for you). Start on
-`kenburns`; reach for a paid backend only when a shot truly needs synthesised
-motion.
+**AI video generation is FREE here — no paid key is required.** Two free
+backends cover everyday B-roll:
+
+- **`kenburns` (default)** — a Flux still pushed/panned with `zoompan` + faint
+  animated grain. Free, instant, fully offline. Best for *concrete* concepts
+  (a campus, a desk) where the image shouldn't change, only the camera.
+- **`flux_morph`** — generates *several* free Flux stills of the concept (varied
+  seeds) and cross-dissolves between them, so the clip visibly **evolves**
+  rather than just panning. Free; offline after the still fetch. Best for
+  *abstract* concepts (plasma, neural fields, energy) — this is the look from
+  premium AI-creator reels, at zero cost. Falls back to `kenburns` if it can't
+  fetch ≥2 stills (e.g. no network).
+
+The paid cloud backends (`replicate`/`runway`/`kling`) are **optional** — true
+image-to-video diffusion for a hero shot, billed per call. You never need them;
+they're there only if you later want the absolute top tier on a tentpole video.
+The local `svd`/`wan` backends are also free once you supply your own compiled
+inference binary + checkpoint (never downloaded for you).
 
 ### Backend env vars
 
