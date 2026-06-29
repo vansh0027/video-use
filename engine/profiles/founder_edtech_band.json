@@ -1,0 +1,16 @@
+{
+  "name": "founder_edtech_band",
+  "description": "founder_edtech variant for fit-band (landscape two-shot) sources. The source is pre-framed into a 9:16 bone band, so punch-in is OFF (zooming would crop the band/padding). Counza visual brand.",
+  "brandkit": "counza",
+  "target_seconds": [20, 40],
+  "silence_gap_trim_s": 0.35,
+  "min_segment_s": 0.4,
+  "visual_change_every_s": 3,
+  "max_static_shot_s": 4,
+  "punch_in": null,
+  "captions": { "on": true, "animated": true, "max_words": 4, "highlight_keywords": true },
+  "audio": { "lufs": -14, "true_peak": -1, "music_duck_db": -20 },
+  "transitions": { "default": "hard_cut" },
+  "cta": { "on": true },
+  "hook_frame_1": true
+}

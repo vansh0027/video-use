@@ -1,0 +1,50 @@
+{
+  "name": "counza",
+  "niche": "College admissions / edtech short-form content. Helps students build standout college profiles. Voice: confident, founder-led, data-driven, peer-to-peer with ambitious high-schoolers.",
+  "colors": {
+    "navy": "#003f7d",
+    "navy_deep": "#13294b",
+    "orange": "#e46e24",
+    "bone": "#f4f8fd",
+    "blue_light": "#e6f0f9",
+    "agent_green": "#22c55e"
+  },
+  "roles": {
+    "accent": "#e46e24",
+    "cta": "#e46e24",
+    "highlight": "#e46e24",
+    "bg": "#f4f8fd",
+    "primary": "#003f7d",
+    "primary_deep": "#13294b"
+  },
+  "fonts": {
+    "serif": "Newsreader",
+    "sans": "Space Grotesk",
+    "caption": "Arial"
+  },
+  "caption_style": {
+    "preset": "oneword_pop",
+    "font": "Arial Black",
+    "fill": "#FFFFFF",
+    "highlight": "#e46e24",
+    "outline": "#003f7d",
+    "bold": true,
+    "animate": true,
+    "uppercase": true,
+    "max_words": 4,
+    "margin_v": 640,
+    "emphasize_numbers": true,
+    "keywords": ["Counza", "Gen-Z", "counseling", "counselors", "college"]
+  },
+  "vocab": "Counza=Kanza|Canza|Konza|Counsa,Gen-Z,counseling",
+  "endcard": {
+    "text": "app.counza.com",
+    "bg": "black",
+    "solid": "white",
+    "duration": 2.5
+  },
+  "cta": {
+    "keyword": "PROFILE",
+    "text": "Comment 'PROFILE' for your free college profile analysis"
+  }
+}
